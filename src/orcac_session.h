@@ -60,12 +60,15 @@ int orcac_session_keep_run(OrcacSessionDirs *dirs);
 extern void (*orcac_test_after_keep)(int root_fd);
 /*
  * Asked by orcac_session_open once the paths are allocated; nonzero
- * takes the out-of-memory path, which removes the new root.
+ * takes the out-of-memory path, which removes the new root without
+ * allocating.
  */
 extern int (*orcac_test_paths_fail)(int parent_fd, const char *root_name);
 /*
  * When positive, counted down by each path allocation of the session;
- * the allocation that brings it to zero fails.
+ * the allocation that brings it to zero fails. When negative, counted
+ * up instead, and the allocation that brings it to zero sets
+ * orcac_test_alloc_stuck, so it and every later one fail.
  */
 extern int orcac_test_alloc_fail;
 #endif

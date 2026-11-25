@@ -1148,6 +1148,86 @@ static void test_session_close_renamed(const char *scratch) {
   CHECK(entry_count(scratch) == before, "scratch not back to its entries");
 }
 
+/*
+ * With allocation failing for good from the kth path allocation of
+ * orcac_session_open on, the new root is still removed: undoing it
+ * allocates nothing. The full walk, which needs a directory stream,
+ * fails under the same injection, so the injection reaches it.
+ */
+static void test_session_alloc_stuck(const char *scratch) {
+  OrcacSessionDirs dirs;
+  char err[256];
+  char tree[4096];
+  int before = entry_count(scratch);
+  int failed = 0;
+  int opened = 0;
+  int parent_fd;
+  int tree_fd;
+
+  snprintf(tree, sizeof(tree), "%s/stuck", scratch);
+  make_tree(tree);
+  parent_fd = open(scratch, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  tree_fd = open(tree, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  CHECK(parent_fd >= 0 && tree_fd >= 0, "open the tree for stuck removal");
+  orcac_test_alloc_stuck = 1;
+  errno = 0;
+  CHECK(orcac_remove_pinned_dir(parent_fd, tree_fd, "stuck") != 0 &&
+            errno == ENOMEM,
+        "walk ran with allocation failing for good");
+  errno = 0;
+  CHECK(orcac_remove_pinned_empty_dir(parent_fd, tree_fd, "stuck") != 0 &&
+            (errno == ENOTEMPTY || errno == EEXIST),
+        "non-empty directory not refused by the empty removal");
+  orcac_test_alloc_stuck = 0;
+  CHECK(tree_intact(tree), "tree touched while allocation failed");
+  if (tree_fd >= 0) {
+    close(tree_fd);
+  }
+  remove_by_path(scratch, "stuck");
+  CHECK(mkdir(tree, 0700) == 0, "mkdir empty directory");
+  tree_fd = open(tree, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  orcac_test_alloc_stuck = 1;
+  CHECK(orcac_remove_pinned_empty_dir(parent_fd, tree_fd, "stuck") == 0 &&
+            access(tree, F_OK) != 0,
+        "empty directory not removed with allocation failing for good");
+  orcac_test_alloc_stuck = 0;
+  if (tree_fd >= 0) {
+    close(tree_fd);
+  }
+  if (parent_fd >= 0) {
+    close(parent_fd);
+  }
+  CHECK(entry_count(scratch) == before, "scratch not back to its entries");
+
+  for (int k = 1; k <= 16 && !opened; ++k) {
+    int rc;
+    int stuck;
+    orcac_test_alloc_fail = -k;
+    err[0] = '\0';
+    rc = orcac_session_open(scratch, &dirs, err, sizeof(err));
+    stuck = orcac_test_alloc_stuck;
+    orcac_test_alloc_fail = 0;
+    orcac_test_alloc_stuck = 0;
+    if (rc == 0) {
+      opened = 1;
+      CHECK(!stuck, "session opened with allocation failing");
+      CHECK(orcac_session_close(&dirs, err, sizeof(err)) == 0,
+            "close after the allocations succeeded");
+      continue;
+    }
+    ++failed;
+    CHECK(stuck, "allocation failure did not persist");
+    CHECK(strstr(err, "out of memory") != NULL,
+          "persistent allocation failure not reported as out of memory");
+    CHECK(entry_count(scratch) == before,
+          "session root left while allocation kept failing");
+    if (entry_count(scratch) != before) {
+      remove_session_dirs(scratch);
+    }
+  }
+  CHECK(opened && failed >= 6, "not every path allocation was failed");
+}
+
 static char swap_session_to[PATH_MAX + 32];
 static char swap_decoy_target[PATH_MAX + 32];
 
@@ -1320,6 +1400,7 @@ int main(int argc, char **argv) {
   test_session_paths_oom(scratch);
   test_session_alloc_fail(scratch);
   test_session_close_renamed(scratch);
+  test_session_alloc_stuck(scratch);
   CHECK(entry_count(scratch) == 0, "scratch directory left non-empty");
   rmdir(scratch);
   test_remove_tree();

@@ -123,6 +123,15 @@ int orcac_empty_dir(int dirfd);
  */
 int orcac_remove_pinned_dir(int parent_fd, int dir_fd, const char *name);
 
+/*
+ * orcac_remove_pinned_dir for a directory that should be empty, as a
+ * root just made: the same identity check, then one unlinkat. Nothing
+ * is allocated, so it works while memory is exhausted. A directory
+ * that holds anything is left whole, with ENOTEMPTY or EEXIST.
+ */
+int orcac_remove_pinned_empty_dir(int parent_fd, int dir_fd,
+                                  const char *name);
+
 #ifdef ORCAC_TEST_HOOKS
 /*
  * Called after a subdirectory is opened, before it is checked and
@@ -137,4 +146,11 @@ extern void (*orcac_test_remove_hook)(int dirfd, const char *name);
  * and the openat that checks it.
  */
 extern void (*orcac_test_run_dir_hook)(int parent_fd, const char *name);
+
+/*
+ * While nonzero, allocation has failed for good: the remover cannot
+ * open a directory stream and every path allocation of the session
+ * fails, each with ENOMEM.
+ */
+extern int orcac_test_alloc_stuck;
 #endif

@@ -640,6 +640,7 @@ int orcac_run_orca(const char *executable,
 
 #ifdef ORCAC_TEST_HOOKS
 void (*orcac_test_remove_hook)(int dirfd, const char *name) = NULL;
+int orcac_test_alloc_stuck = 0;
 #endif
 
 /* Deeper trees are refused rather than holding a descriptor per level. */
@@ -660,6 +661,8 @@ void (*orcac_test_remove_hook)(int dirfd, const char *name) = NULL;
  * held open. fd[0] is the root; fd[i] was opened from fd[i-1] through
  * name[i] with O_NOFOLLOW and was dev[i], ino[i] then. Every open,
  * stat and unlink of the walk is relative to one of these descriptors.
+ * One lives on the stack of each removal, about 18 KiB, so starting a
+ * removal never depends on an allocation.
  */
 typedef struct RemoveChain {
   int depth;
@@ -827,9 +830,20 @@ static int remove_entry_at(RemoveChain *c, const char *name) {
  * entered. The walk stops once the chain is no longer intact. Entries
  * still present after the last pass are -1 with EAGAIN.
  */
+/* fdopendir allocates the stream. */
+static DIR *open_dir_stream(int fd) {
+#ifdef ORCAC_TEST_HOOKS
+  if (orcac_test_alloc_stuck) {
+    errno = ENOMEM;
+    return NULL;
+  }
+#endif
+  return fdopendir(fd);
+}
+
 static int empty_dir_fd(RemoveChain *c) {
   int fd = c->fd[c->depth];
-  DIR *dir = fdopendir(fd);
+  DIR *dir = open_dir_stream(fd);
   int first = 0;
   int empty = 0;
   if (dir == NULL) {
@@ -892,25 +906,19 @@ static int empty_dir_fd(RemoveChain *c) {
   return 0;
 }
 
-static RemoveChain *chain_new(int root_fd, const struct stat *root) {
-  RemoveChain *c = (RemoveChain *)malloc(sizeof(*c));
-  if (c == NULL) {
-    errno = ENOMEM;
-    return NULL;
-  }
+static void chain_init(RemoveChain *c, int root_fd, const struct stat *root) {
   c->depth = 0;
   c->fd[0] = root_fd;
   c->dev[0] = root->st_dev;
   c->ino[0] = root->st_ino;
   c->name[0][0] = '\0';
-  return c;
 }
 
 /* The name under which parent_fd holds the directory child, into out. */
 static int child_name(int parent_fd, const struct stat *child, char *out) {
   int found = -1;
   int fd = openat(parent_fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-  DIR *dir = fd >= 0 ? fdopendir(fd) : NULL;
+  DIR *dir = fd >= 0 ? open_dir_stream(fd) : NULL;
   struct dirent *ent;
   if (dir == NULL) {
     if (fd >= 0) {
@@ -996,10 +1004,8 @@ static int chain_pin_to(RemoveChain *c, int dirfd, int level) {
 
 int orcac_empty_dir(int dirfd) {
   struct stat st;
-  RemoveChain *c;
+  RemoveChain c;
   int fd;
-  int rc;
-  int saved;
   if (dirfd < 0 || fstat(dirfd, &st) != 0) {
     return -1;
   }
@@ -1011,23 +1017,14 @@ int orcac_empty_dir(int dirfd) {
   if (fd < 0) {
     return -1;
   }
-  c = chain_new(fd, &st);
-  if (c == NULL) {
-    close(fd);
-    errno = ENOMEM;
-    return -1;
-  }
-  rc = empty_dir_fd(c);
-  saved = errno;
-  free(c);
-  errno = saved;
-  return rc;
+  chain_init(&c, fd, &st);
+  return empty_dir_fd(&c);
 }
 
 int orcac_remove_tree_below(int root_fd, int dirfd, int level,
                             const char *name) {
   struct stat root;
-  RemoveChain *c;
+  RemoveChain c;
   int rc;
   int saved;
   if (root_fd < 0 || dirfd < 0 || level < 0 ||
@@ -1043,21 +1040,16 @@ int orcac_remove_tree_below(int root_fd, int dirfd, int level,
     errno = ENOTDIR;
     return -1;
   }
-  c = chain_new(root_fd, &root);
-  if (c == NULL) {
-    return -1;
-  }
-  if (chain_pin_to(c, dirfd, level) != 0) {
-    free(c);
+  chain_init(&c, root_fd, &root);
+  if (chain_pin_to(&c, dirfd, level) != 0) {
     errno = EXDEV;
     return -1;
   }
-  rc = remove_entry_at(c, name);
+  rc = remove_entry_at(&c, name);
   saved = errno;
-  for (int i = 1; i <= c->depth; ++i) {
-    close(c->fd[i]);
+  for (int i = 1; i <= c.depth; ++i) {
+    close(c.fd[i]);
   }
-  free(c);
   errno = saved;
   return rc;
 }
@@ -1066,56 +1058,66 @@ int orcac_remove_tree_at(int dirfd, const char *name) {
   return orcac_remove_tree_below(dirfd, dirfd, 0, name);
 }
 
-int orcac_remove_pinned_dir(int parent_fd, int dir_fd, const char *name) {
-  struct stat parent;
-  struct stat st;
-  RemoveChain *c;
-  int fd;
-  int rc;
-  int saved;
+/*
+ * Fill parent and st, and check that dir_fd is a directory held by
+ * parent_fd under name, by device and inode: otherwise -1 with EXDEV.
+ */
+static int pinned_entry(int parent_fd, int dir_fd, const char *name,
+                        struct stat *parent, struct stat *st) {
   if (parent_fd < 0 || dir_fd < 0 || name == NULL || name[0] == '\0' ||
       is_dot_name(name) || strchr(name, '/') != NULL) {
     errno = EINVAL;
     return -1;
   }
-  if (fstat(parent_fd, &parent) != 0 || fstat(dir_fd, &st) != 0) {
+  if (fstat(parent_fd, parent) != 0 || fstat(dir_fd, st) != 0) {
     return -1;
   }
-  if (!S_ISDIR(st.st_mode)) {
+  if (!S_ISDIR(st->st_mode)) {
     errno = ENOTDIR;
     return -1;
   }
-  if (st.st_dev != parent.st_dev ||
-      !entry_is(parent_fd, name, st.st_dev, st.st_ino)) {
+  if (st->st_dev != parent->st_dev ||
+      !entry_is(parent_fd, name, st->st_dev, st->st_ino)) {
     errno = EXDEV;
+    return -1;
+  }
+  return 0;
+}
+
+int orcac_remove_pinned_dir(int parent_fd, int dir_fd, const char *name) {
+  struct stat parent;
+  struct stat st;
+  RemoveChain c;
+  int fd;
+  if (pinned_entry(parent_fd, dir_fd, name, &parent, &st) != 0) {
     return -1;
   }
   fd = openat(dir_fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
   if (fd < 0) {
     return -1;
   }
-  c = chain_new(parent_fd, &parent);
-  if (c == NULL) {
+  chain_init(&c, parent_fd, &parent);
+  if (chain_push(&c, fd, &st, name) != 0) {
+    int saved = errno;
     close(fd);
-    errno = ENOMEM;
-    return -1;
-  }
-  if (chain_push(c, fd, &st, name) != 0) {
-    saved = errno;
-    close(fd);
-    free(c);
     errno = saved;
     return -1;
   }
-  rc = empty_dir_fd(c);
-  saved = errno;
-  free(c);
-  if (rc != 0) {
-    errno = saved;
+  if (empty_dir_fd(&c) != 0) {
     return -1;
   }
   if (!entry_is(parent_fd, name, st.st_dev, st.st_ino)) {
     errno = EXDEV;
+    return -1;
+  }
+  return unlinkat(parent_fd, name, AT_REMOVEDIR);
+}
+
+int orcac_remove_pinned_empty_dir(int parent_fd, int dir_fd,
+                                  const char *name) {
+  struct stat parent;
+  struct stat st;
+  if (pinned_entry(parent_fd, dir_fd, name, &parent, &st) != 0) {
     return -1;
   }
   return unlinkat(parent_fd, name, AT_REMOVEDIR);

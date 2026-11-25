@@ -23,6 +23,13 @@ static void *alloc(size_t n) {
   if (orcac_test_alloc_fail > 0 && --orcac_test_alloc_fail == 0) {
     return NULL;
   }
+  if (orcac_test_alloc_fail < 0 && ++orcac_test_alloc_fail == 0) {
+    orcac_test_alloc_stuck = 1;
+  }
+  if (orcac_test_alloc_stuck) {
+    errno = ENOMEM;
+    return NULL;
+  }
 #endif
   return malloc(n);
 }
@@ -92,6 +99,22 @@ static int remove_root(const OrcacSessionDirs *dirs, const char *name) {
   return orcac_remove_pinned_dir(dirs->parent_fd, dirs->root_fd, name);
 }
 
+/*
+ * Undo a root that was just made and is still empty, without
+ * allocating, so allocation failing for good cannot leave it behind.
+ * Only a root that somehow holds entries takes the walk.
+ */
+static int remove_new_root(const OrcacSessionDirs *dirs, const char *name) {
+  if (orcac_remove_pinned_empty_dir(dirs->parent_fd, dirs->root_fd, name) ==
+      0) {
+    return 0;
+  }
+  if (errno != ENOTEMPTY && errno != EEXIST) {
+    return -1;
+  }
+  return remove_root(dirs, name);
+}
+
 static int paths_fail(const OrcacSessionDirs *dirs, const char *name) {
 #ifdef ORCAC_TEST_HOOKS
   return orcac_test_paths_fail != NULL &&
@@ -145,7 +168,7 @@ int orcac_session_open(const char *scratch_root, OrcacSessionDirs *dirs,
   if (dirs->root == NULL || dirs->root_name == NULL || dirs->run == NULL ||
       dirs->guess == NULL || dirs->keep_failed == NULL ||
       paths_fail(dirs, name)) {
-    remove_root(dirs, name);
+    remove_new_root(dirs, name);
     close_fd(&dirs->root_fd);
     close_fd(&dirs->parent_fd);
     free(dirs->root);

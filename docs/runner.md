@@ -99,9 +99,14 @@ scratch directory therefore cannot redirect or truncate a file.
 the root (whichever of its allocations fails, since the root's name is
 taken from a stack buffer), first check that the pinned parent's entry is still the pinned
 root, by device and inode, and remove nothing with `EXDEV` otherwise.
-The walk that empties the root then treats the pinned parent as the
+`orcac_session_open` then removes its still-empty root with that check
+and a single `unlinkat`, allocating nothing, so the root goes even
+while every allocation keeps failing.
+The walk that empties the root treats the pinned parent as the
 top of its chain, so that check is repeated before every descent and
-every unlink, and once more before the root's own entry is removed. A
+every unlink, and once more before the root's own entry is removed.
+The chain of pinned levels lives on the stack, so starting a removal
+needs no allocation; only reading a directory does. A
 new root that was opened but fails its checks is removed again only
 while its entry is still the opened directory of this user. A new root
 that could not be opened at all is left in place and the error says
@@ -177,6 +182,7 @@ including a directory swapped for a symlink during removal, an ancestor
 renamed out of the tree just before a descent or an unlink, a directory
 that keeps refilling, the session root swapped for a decoy mid-call and
 before destroy, the root renamed away before or during its removal,
+a new root undone while every allocation keeps failing,
 `.gbw` and `.engrad` outputs left as symlinks, the owner
 pid check, unconverged-SCF detection with banners echoed from the
 input, the termination banner echoed from `blocks` on both the exit-0
