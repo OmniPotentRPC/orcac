@@ -1,0 +1,1 @@
+CI builds and tests on every push and pull request, and runs the suite under the address and undefined-behaviour sanitizers with gcc and clang. Every lane generates a comma-decimal locale and sets `ORCAC_REQUIRE_COMMA_LOCALE=1`.

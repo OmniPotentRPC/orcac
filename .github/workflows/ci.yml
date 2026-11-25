@@ -1,0 +1,72 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+# meson comes from pip: releases before 1.4 ignore the b_sanitize=none
+# override on the vendored c-capnproto runtime.
+env:
+  MESON_VERSION: "1.9.1"
+  ORCAC_REQUIRE_COMMA_LOCALE: "1"
+
+jobs:
+  build-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config python3 python3-pip \
+            capnproto locales
+          python3 -m pip install --user --break-system-packages \
+            "meson==${MESON_VERSION}"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Generate a comma-decimal locale
+        run: |
+          sudo locale-gen de_DE.UTF-8
+          LC_ALL=de_DE.UTF-8 locale decimal_point | grep -qx ','
+      - name: Configure
+        run: meson setup build
+      - name: Build
+        run: meson compile -C build
+      - name: Test
+        run: meson test -C build --print-errorlogs
+
+  sanitize:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    env:
+      CC: ${{ matrix.cc }}
+      ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config python3 python3-pip \
+            capnproto locales clang
+          clang_major=$(clang -dumpversion | cut -d. -f1)
+          sudo apt-get install -y "libclang-rt-${clang_major}-dev"
+          python3 -m pip install --user --break-system-packages \
+            "meson==${MESON_VERSION}"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Generate a comma-decimal locale
+        run: |
+          sudo locale-gen de_DE.UTF-8
+          LC_ALL=de_DE.UTF-8 locale decimal_point | grep -qx ','
+      # No -Dwerror: it reaches the vendored runtime, whose GCC-only
+      # warning flags clang rejects.
+      - name: Configure
+        run: >-
+          meson setup build-san
+          -Db_sanitize=address,undefined -Db_lundef=false
+      - name: Build
+        run: meson compile -C build-san
+      - name: Test
+        run: meson test -C build-san --print-errorlogs

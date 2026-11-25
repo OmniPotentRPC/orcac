@@ -137,6 +137,11 @@ that runs ORCA and it is reported as skipped without one. The comma-decimal
 locale checks skip when no `de_DE` or `fr_FR` locale is installed;
 `ORCAC_REQUIRE_COMMA_LOCALE=1` makes that a failure instead.
 
+A sanitizer build (`-Db_sanitize=address,undefined -Db_lundef=false`, or
+`pixi run test-sanitize`) needs meson 1.4 or newer. Older releases ignore
+the `b_sanitize=none` override on the vendored c-capnproto runtime, whose
+known undefined behaviour then fails `config_capnp`.
+
 Install header, library and `orcac.pc` (`soversion` 1):
 
 ```
