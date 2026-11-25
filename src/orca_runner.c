@@ -175,6 +175,30 @@ static void random_suffix(char *out, size_t n, unsigned int attempt) {
   out[n] = '\0';
 }
 
+#ifdef ORCAC_TEST_HOOKS
+void (*orcac_test_run_dir_hook)(int parent_fd, const char *name) = NULL;
+#endif
+
+/*
+ * Undo the mkdirat of name in parent_fd after the new directory failed
+ * its checks. With fd open, the entry goes only while it is still that
+ * directory. Without it, only an empty directory of this user under the
+ * name goes; AT_REMOVEDIR never follows a symlink and never removes a
+ * directory that holds anything.
+ */
+static void discard_run_dir(int parent_fd, const char *name, int fd) {
+  int saved = errno;
+  struct stat st;
+  struct stat entry;
+  if (fstatat(parent_fd, name, &entry, AT_SYMLINK_NOFOLLOW) == 0 &&
+      S_ISDIR(entry.st_mode) && entry.st_uid == geteuid() &&
+      (fd < 0 || (fstat(fd, &st) == 0 && st.st_dev == entry.st_dev &&
+                  st.st_ino == entry.st_ino))) {
+    unlinkat(parent_fd, name, AT_REMOVEDIR);
+  }
+  errno = saved;
+}
+
 int orcac_make_run_dir(const char *scratch_root,
                        int *parent_fd_out,
                        int *dir_fd_out,
@@ -235,6 +259,11 @@ int orcac_make_run_dir(const char *scratch_root,
    * Between mkdirat and openat the entry could be swapped, so check
    * that what the pinned parent holds is the private directory made.
    */
+#ifdef ORCAC_TEST_HOOKS
+  if (orcac_test_run_dir_hook != NULL) {
+    orcac_test_run_dir_hook(parent_fd, name);
+  }
+#endif
   fd = openat(parent_fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   if (fd < 0 || fstat(fd, &st) != 0 ||
       fstatat(parent_fd, name, &entry, AT_SYMLINK_NOFOLLOW) != 0 ||
@@ -243,6 +272,7 @@ int orcac_make_run_dir(const char *scratch_root,
     orcac_errf(errbuf, errbuf_n,
                "orcac: scratch directory %s changed before it was opened",
                run_dir);
+    discard_run_dir(parent_fd, name, fd);
     if (fd >= 0) {
       close(fd);
     }

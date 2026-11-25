@@ -37,8 +37,9 @@ int orcac_resolve_executable(const char *requested,
  * stays pinned in *parent_fd_out; the new directory is made with mkdirat
  * relative to it, under a fresh random name while names are taken, and
  * opened through it with O_NOFOLLOW into *dir_fd_out and must be the
- * entry the parent holds, owned by this user and mode 0700. run_dir gets
- * its path, for messages only.
+ * entry the parent holds, owned by this user and mode 0700. A new
+ * directory that fails those checks is removed again while its entry is
+ * still that empty directory. run_dir gets its path, for messages only.
  */
 int orcac_make_run_dir(const char *scratch_root,
                        int *parent_fd_out,
@@ -119,4 +120,10 @@ int orcac_empty_dir(int dirfd);
  * at dirfd, including its final check that nothing is left.
  */
 extern void (*orcac_test_remove_hook)(int dirfd, const char *name);
+
+/*
+ * Called by orcac_make_run_dir between the mkdirat of name in parent_fd
+ * and the openat that checks it.
+ */
+extern void (*orcac_test_run_dir_hook)(int parent_fd, const char *name);
 #endif
