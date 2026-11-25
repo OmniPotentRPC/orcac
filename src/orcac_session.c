@@ -74,23 +74,13 @@ void orcac_session_free(OrcacSessionDirs *dirs) {
 }
 
 /*
- * Empty the root through its descriptor, then remove its entry from the
- * pinned parent, but only while that entry is still the pinned root, so
- * a root renamed away or replaced by a symlink is left alone.
+ * Empty and remove the root only while the pinned parent's entry is
+ * still the pinned root, checked before anything is removed and again
+ * before each removal, so a root renamed away or replaced is left alone.
  */
 static int remove_root(const OrcacSessionDirs *dirs) {
-  struct stat st;
-  struct stat entry;
-  if (orcac_empty_dir(dirs->root_fd) != 0 || fstat(dirs->root_fd, &st) != 0 ||
-      fstatat(dirs->parent_fd, dirs->root_name, &entry,
-              AT_SYMLINK_NOFOLLOW) != 0) {
-    return -1;
-  }
-  if (st.st_dev != entry.st_dev || st.st_ino != entry.st_ino) {
-    errno = EXDEV;
-    return -1;
-  }
-  return unlinkat(dirs->parent_fd, dirs->root_name, AT_REMOVEDIR);
+  return orcac_remove_pinned_dir(dirs->parent_fd, dirs->root_fd,
+                                 dirs->root_name);
 }
 
 static int paths_fail(const OrcacSessionDirs *dirs) {

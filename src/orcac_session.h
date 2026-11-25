@@ -33,9 +33,10 @@ int orcac_session_open(const char *scratch_root, OrcacSessionDirs *dirs,
                        char *errbuf, size_t errbuf_n);
 
 /*
- * Remove the whole tree, then free the paths. The root is removed from
- * the pinned parent only while that entry is still the pinned root.
- * Returns -1, with the reason in errbuf, when anything is left behind.
+ * Remove the whole tree, then free the paths. Nothing is removed unless
+ * the pinned parent's entry is still the pinned root; a root renamed
+ * away or replaced is left whole, with EXDEV. Returns -1, with the
+ * reason in errbuf, when anything is left behind.
  */
 int orcac_session_close(OrcacSessionDirs *dirs, char *errbuf,
                         size_t errbuf_n);

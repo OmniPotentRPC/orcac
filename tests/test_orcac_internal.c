@@ -1007,6 +1007,69 @@ static void test_remove_tree(void) {
   CHECK(rmdir(work) == 0, "work directory left non-empty");
 }
 
+static void remove_by_path(const char *dir, const char *name) {
+  int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  CHECK(fd >= 0 && orcac_remove_tree_at(fd, name) == 0, name);
+  if (fd >= 0) {
+    close(fd);
+  }
+}
+
+static char mid_root[PATH_MAX + 32];
+static char mid_moved[PATH_MAX + 32];
+static int mid_calls = 0;
+
+/* Rename the session root away as soon as its removal starts reading. */
+static void rename_root_mid_walk(int dirfd, const char *name) {
+  (void)dirfd;
+  if (name == NULL && mid_calls++ == 0) {
+    CHECK(rename(mid_root, mid_moved) == 0, "rename the root mid-walk");
+  }
+}
+
+/*
+ * Closing a session leaves its root whole when the root was renamed
+ * away before the close, and stops with EXDEV, leaving the rest, when
+ * it is renamed away while being emptied.
+ */
+static void test_session_close_renamed(const char *scratch) {
+  OrcacSessionDirs dirs;
+  char err[256];
+  int before = entry_count(scratch);
+
+  snprintf(mid_moved, sizeof(mid_moved), "%s/moved-mid", scratch);
+  CHECK(orcac_session_open(scratch, &dirs, err, sizeof(err)) == 0,
+        "open for a renamed root");
+  if (dirs.root == NULL) {
+    return;
+  }
+  CHECK(rename(dirs.root, mid_moved) == 0, "rename the root away");
+  err[0] = '\0';
+  CHECK(orcac_session_close(&dirs, err, sizeof(err)) != 0 &&
+            strstr(err, strerror(EXDEV)) != NULL,
+        "close of a renamed root not refused with EXDEV");
+  CHECK(entry_count(mid_moved) == 3, "renamed root emptied by close");
+  remove_by_path(scratch, "moved-mid");
+
+  CHECK(orcac_session_open(scratch, &dirs, err, sizeof(err)) == 0,
+        "open for a root renamed mid-walk");
+  if (dirs.root == NULL) {
+    return;
+  }
+  snprintf(mid_root, sizeof(mid_root), "%s", dirs.root);
+  mid_calls = 0;
+  orcac_test_remove_hook = rename_root_mid_walk;
+  err[0] = '\0';
+  CHECK(orcac_session_close(&dirs, err, sizeof(err)) != 0 &&
+            strstr(err, strerror(EXDEV)) != NULL,
+        "close of a root renamed mid-walk not refused with EXDEV");
+  orcac_test_remove_hook = NULL;
+  CHECK(mid_calls >= 1, "mid-walk hook not called");
+  CHECK(entry_count(mid_moved) == 3, "root emptied after it was renamed");
+  remove_by_path(scratch, "moved-mid");
+  CHECK(entry_count(scratch) == before, "scratch not back to its entries");
+}
+
 static char swap_session_to[PATH_MAX + 32];
 static char swap_decoy_target[PATH_MAX + 32];
 
@@ -1089,18 +1152,19 @@ static void test_pinned_run_files(const char *fake_bin, const char *scratch) {
   CHECK(entry_count(run_copy) == 2, "files created in the decoy run/");
   orcac_destroy(s);
   CHECK(strstr(orcac_last_error(NULL), "could not remove session directory") !=
-            NULL,
+                NULL &&
+            strstr(orcac_last_error(NULL), strerror(EXDEV)) != NULL,
         "destroy did not report the root it could not remove");
   CHECK(file_is(run_copy, "orcac.inp", "precious") &&
             file_is(scratch, "target", "target"),
         "destroy touched the decoy");
-  CHECK(entry_count(swap_session_to) == 0,
-        "real session tree not emptied by destroy");
+  CHECK(entry_count(swap_session_to) == 3,
+        "session tree emptied after it was renamed away");
   unlink(decoy_inp);
   unlink(decoy_out);
   rmdir(run_copy);
   rmdir(root_copy);
-  rmdir(swap_session_to);
+  remove_by_path(scratch, "moved-root");
   unlink(swap_decoy_target);
 
   /* An empty directory swapped in for the root is not removed either. */
@@ -1115,9 +1179,10 @@ static void test_pinned_run_files(const char *fake_bin, const char *scratch) {
   CHECK(access(root_copy, F_OK) == 0 &&
             strstr(orcac_last_error(NULL), "could not remove") != NULL,
         "destroy removed an empty directory swapped in for the root");
-  CHECK(entry_count(swap_session_to) == 0, "moved session tree not emptied");
+  CHECK(entry_count(swap_session_to) == 3,
+        "moved session tree emptied outside the session path");
   rmdir(root_copy);
-  rmdir(swap_session_to);
+  remove_by_path(scratch, "moved-root");
 
   if (geteuid() == 0) {
     return;
@@ -1175,6 +1240,7 @@ int main(int argc, char **argv) {
   test_make_run_dir(scratch);
   test_make_run_dir_discard(scratch);
   test_session_paths_oom(scratch);
+  test_session_close_renamed(scratch);
   CHECK(entry_count(scratch) == 0, "scratch directory left non-empty");
   rmdir(scratch);
   test_remove_tree();

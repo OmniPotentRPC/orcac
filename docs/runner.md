@@ -96,8 +96,12 @@ regular files. Guess slots are copied, renamed and removed relative to
 `guess/`. Replacing the root or any directory above it in a writable
 scratch directory therefore cannot redirect or truncate a file.
 `orcac_destroy`, and `orcac_session_open` when it fails after making
-the root, remove the root's entry from the pinned parent only while that
-entry is still the pinned root. A new root that fails its checks is
+the root, first check that the pinned parent's entry is still the pinned
+root, by device and inode, and remove nothing with `EXDEV` otherwise.
+The walk that empties the root then treats the pinned parent as the
+top of its chain, so that check is repeated before every descent and
+every unlink, and once more before the root's own entry is removed. A
+new root that fails its checks is
 removed again only while it is still the empty directory that was made.
 
 The remover pins a descriptor for every level from the session root
@@ -161,7 +165,8 @@ the MPI scrub, the session layout and kept failures, symlink escape
 including a directory swapped for a symlink during removal, an ancestor
 renamed out of the tree just before a descent or an unlink, a directory
 that keeps refilling, the session root swapped for a decoy mid-call and
-before destroy, `.gbw` and `.engrad` outputs left as symlinks, the owner
+before destroy, the root renamed away before or during its removal,
+`.gbw` and `.engrad` outputs left as symlinks, the owner
 pid check, unconverged-SCF detection with banners echoed from the
 input, the termination banner echoed from `blocks` on both the exit-0
 and the lost-status paths, the guess key, the MORead

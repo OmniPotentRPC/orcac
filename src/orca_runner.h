@@ -112,6 +112,15 @@ int orcac_remove_tree_at(int dirfd, const char *name);
 /* Remove everything inside the directory open at dirfd, as above. */
 int orcac_empty_dir(int dirfd);
 
+/*
+ * Remove the directory open at dir_fd, and everything in it, from
+ * parent_fd, where it must sit under name. Nothing is touched unless
+ * that entry is dir_fd by device and inode: otherwise -1 with EXDEV.
+ * The walk then treats parent_fd as its root, so a rename of dir_fd out
+ * of parent_fd during the walk stops it with EXDEV as above.
+ */
+int orcac_remove_pinned_dir(int parent_fd, int dir_fd, const char *name);
+
 #ifdef ORCAC_TEST_HOOKS
 /*
  * Called after a subdirectory is opened, before it is checked and

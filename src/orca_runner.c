@@ -1055,3 +1055,58 @@ int orcac_remove_tree_below(int root_fd, int dirfd, int level,
 int orcac_remove_tree_at(int dirfd, const char *name) {
   return orcac_remove_tree_below(dirfd, dirfd, 0, name);
 }
+
+int orcac_remove_pinned_dir(int parent_fd, int dir_fd, const char *name) {
+  struct stat parent;
+  struct stat st;
+  RemoveChain *c;
+  int fd;
+  int rc;
+  int saved;
+  if (parent_fd < 0 || dir_fd < 0 || name == NULL || name[0] == '\0' ||
+      is_dot_name(name) || strchr(name, '/') != NULL) {
+    errno = EINVAL;
+    return -1;
+  }
+  if (fstat(parent_fd, &parent) != 0 || fstat(dir_fd, &st) != 0) {
+    return -1;
+  }
+  if (!S_ISDIR(st.st_mode)) {
+    errno = ENOTDIR;
+    return -1;
+  }
+  if (st.st_dev != parent.st_dev ||
+      !entry_is(parent_fd, name, st.st_dev, st.st_ino)) {
+    errno = EXDEV;
+    return -1;
+  }
+  fd = openat(dir_fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (fd < 0) {
+    return -1;
+  }
+  c = chain_new(parent_fd, &parent);
+  if (c == NULL) {
+    close(fd);
+    errno = ENOMEM;
+    return -1;
+  }
+  if (chain_push(c, fd, &st, name) != 0) {
+    saved = errno;
+    close(fd);
+    free(c);
+    errno = saved;
+    return -1;
+  }
+  rc = empty_dir_fd(c);
+  saved = errno;
+  free(c);
+  if (rc != 0) {
+    errno = saved;
+    return -1;
+  }
+  if (!entry_is(parent_fd, name, st.st_dev, st.st_ino)) {
+    errno = EXDEV;
+    return -1;
+  }
+  return unlinkat(parent_fd, name, AT_REMOVEDIR);
+}
