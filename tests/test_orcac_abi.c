@@ -11,6 +11,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <locale.h>
 #include <math.h>
 #include <pthread.h>
 #include <signal.h>
@@ -437,6 +438,9 @@ static void test_input_validation(void) {
   cfg = base_config();
   cfg.method = "HF\n%pal nprocs 2 end";
   expect_create(&cfg, ORCAC_E_INVALID, "method newline", "single line");
+  cfg = base_config();
+  cfg.method = "";
+  expect_create(&cfg, ORCAC_E_INVALID, "empty method", "method must not be empty");
   for (size_t i = 0; i < sizeof(bad_tokens) / sizeof(bad_tokens[0]); ++i) {
     cfg = base_config();
     cfg.method = bad_tokens[i];
@@ -488,6 +492,34 @@ static void test_input_validation(void) {
     CHECK(strstr(text, "%pal") == NULL, "nprocs 1 must omit %pal");
     free(text);
   }
+  orcac_destroy(s);
+}
+
+static void test_error_outparam_contract(void) {
+  OrcaCConfig cfg = base_config();
+  OrcaCSession *s = make(&cfg);
+  OrcaCResult meta;
+  double e = 1234.5;
+  double g[9];
+  int st;
+
+  for (int i = 0; i < 9; ++i) {
+    g[i] = 6789.0 + (double)i;
+  }
+  CHECK(s != NULL, "create for out-parameter contract");
+  if (s == NULL) {
+    return;
+  }
+  memset(&meta, 0xA5, sizeof(meta));
+  meta.struct_size = sizeof(meta);
+  st = orcac_energy_gradient(s, 3, kPos, kZ, kWant | ORCAC_WANT_STRESS, &e, g,
+                             &meta);
+  CHECK(st == ORCAC_E_UNSUPPORTED, "expected unsupported status");
+  CHECK(e == 1234.5 && g[0] == 6789.0 && g[8] == 6797.0,
+        "energy or gradient changed on error");
+  CHECK(meta.status == ORCAC_E_UNSUPPORTED && meta.orca_runs == 0 &&
+            meta.exit_code == -1 && meta.message[0] != '\0',
+        "meta was not populated on error");
   orcac_destroy(s);
 }
 
@@ -751,6 +783,115 @@ static void test_moread_retry(void) {
         "failed guess slot was not dropped");
   CHECK(replay_ok(eval(s, &e, g, &meta), &e, g) && meta.used_guess == 1,
         "guess not stored again after a fresh run");
+  orcac_destroy(s);
+}
+
+static void test_moread_slot_kept_on_cancel_timeout(void) {
+  OrcaCConfig cfg = base_config();
+  OrcaCSession *s;
+  OrcaCResult meta;
+  Worker w;
+  pthread_t th;
+  double e = 0.0;
+  double g[9];
+  char *started = join(work, "started-moread");
+  double t0;
+  int st;
+
+  cfg.guess_policy = ORCAC_GUESS_CHAIN;
+  s = make(&cfg);
+  CHECK(s != NULL, "create for cancel/timeout guess retention");
+  if (s == NULL) {
+    free(started);
+    return;
+  }
+  CHECK(replay_ok(eval(s, &e, g, &meta), &e, g), "seed chained run");
+  CHECK(replay_ok(eval(s, &e, g, &meta), &e, g) && meta.used_guess == 1,
+        "second chained run did not use MORead");
+
+  unlink(started);
+  setenv("ORCAC_FAKE_SLEEP", "20", 1);
+  setenv("ORCAC_FAKE_STARTED", started, 1);
+  memset(&w, 0, sizeof(w));
+  w.s = s;
+  if (pthread_create(&th, NULL, worker_main, &w) != 0) {
+    CHECK(0, "pthread_create in cancel/timeout test");
+    unsetenv("ORCAC_FAKE_SLEEP");
+    unsetenv("ORCAC_FAKE_STARTED");
+    orcac_destroy(s);
+    free(started);
+    return;
+  }
+  t0 = now_s();
+  while (access(started, F_OK) != 0 && now_s() - t0 < 10.0) {
+    nap_ms(10);
+  }
+  CHECK(access(started, F_OK) == 0, "cancel test run never started");
+  CHECK(orcac_cancel(s) == ORCAC_OK, "orcac_cancel in guess retention test");
+  pthread_join(th, NULL);
+  unsetenv("ORCAC_FAKE_STARTED");
+  CHECK(w.status == ORCAC_E_CANCELLED && w.meta.used_guess == 1,
+        "cancelled run did not report used MORead guess");
+
+  setenv("ORCAC_FAKE_SLEEP", "20", 1);
+  cfg.timeout_s = 0.5;
+  CHECK(orcac_configure(s, &cfg) == ORCAC_OK, "configure timeout for MORead");
+  st = eval(s, &e, g, &meta);
+  CHECK(st == ORCAC_E_TIMEOUT && meta.used_guess == 1,
+        "timed-out run did not report used MORead guess");
+  unsetenv("ORCAC_FAKE_SLEEP");
+  cfg.timeout_s = 30.0;
+  CHECK(orcac_configure(s, &cfg) == ORCAC_OK, "restore timeout after MORead");
+
+  CHECK(replay_ok(eval(s, &e, g, &meta), &e, g) && meta.used_guess == 1,
+        "guess was dropped after cancel or timeout");
+  orcac_destroy(s);
+  free(started);
+}
+
+static void test_locale_numeric(void) {
+  OrcaCConfig cfg = base_config();
+  OrcaCSession *s;
+  OrcaCResult meta;
+  locale_t oldloc;
+  locale_t de = newlocale(LC_NUMERIC_MASK, "de_DE.UTF-8", (locale_t)0);
+  double e = 0.0;
+  double g[9];
+  char *log_text;
+
+  if (de == (locale_t)0) {
+    de = newlocale(LC_NUMERIC_MASK, "de_DE.utf8", (locale_t)0);
+  }
+  if (de == (locale_t)0) {
+    return;
+  }
+
+  s = make(&cfg);
+  CHECK(s != NULL, "create for locale test");
+  if (s == NULL) {
+    freelocale(de);
+    return;
+  }
+  oldloc = uselocale(de);
+  CHECK(oldloc != (locale_t)0, "uselocale for de_DE");
+  if (oldloc == (locale_t)0) {
+    orcac_destroy(s);
+    freelocale(de);
+    return;
+  }
+  unlink(log_file);
+  CHECK(replay_ok(eval(s, &e, g, &meta), &e, g), "eval under comma locale");
+  uselocale(oldloc);
+  freelocale(de);
+
+  log_text = slurp(log_file);
+  CHECK(log_text != NULL, "missing fake log under locale test");
+  if (log_text != NULL) {
+    CHECK(strstr(log_text, "0.1173000000") != NULL &&
+              strstr(log_text, "0,1173000000") == NULL,
+          "deck formatting followed LC_NUMERIC instead of C");
+    free(log_text);
+  }
   orcac_destroy(s);
 }
 
@@ -1295,11 +1436,13 @@ int main(int argc, char **argv) {
   test_config_header();
   test_additive_layouts();
   test_input_validation();
+  test_error_outparam_contract();
   test_want_mask();
   test_busy_and_cancel();
   test_other_process();
   test_not_converged();
   test_moread_retry();
+  test_moread_slot_kept_on_cancel_timeout();
   test_guess_invalidation();
   test_guess_key();
   test_malformed_output();
@@ -1308,6 +1451,7 @@ int main(int argc, char **argv) {
   test_mpi_env();
   test_lookup();
   test_thread_local_error();
+  test_locale_numeric();
   test_no_timeout();
 
   CHECK(count_entries(scratch) == 0, "run directories leaked");

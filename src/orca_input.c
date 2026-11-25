@@ -1,5 +1,6 @@
 #include "orca_input.h"
 #include "orcac_errbuf.h"
+#include "orcac_locale.h"
 
 #include <ctype.h>
 #include <stdarg.h>
@@ -265,7 +266,7 @@ static void buf_appendf(TextBuf *b, const char *fmt, ...) {
     return;
   }
   va_start(ap, fmt);
-  need = vsnprintf(NULL, 0, fmt, ap);
+  need = orcac_vsnprintf_c(NULL, 0, fmt, ap);
   va_end(ap);
   if (need < 0) {
     b->failed = 1;
@@ -286,7 +287,7 @@ static void buf_appendf(TextBuf *b, const char *fmt, ...) {
     b->cap = cap;
   }
   va_start(ap, fmt);
-  vsnprintf(b->data + b->used, b->cap - b->used, fmt, ap);
+  orcac_vsnprintf_c(b->data + b->used, b->cap - b->used, fmt, ap);
   va_end(ap);
   b->used += (size_t)need;
 }
@@ -305,6 +306,10 @@ int orcac_render_input(const OrcacDeck *deck, int n_atoms,
   if (input_text == NULL || deck == NULL || positions_ang == NULL ||
       atomic_numbers == NULL || n_atoms <= 0) {
     orcac_errf(errbuf, errbuf_n, "orcac: invalid input-writer arguments");
+    return -1;
+  }
+  if (deck->method != NULL && deck->method[0] == '\0') {
+    orcac_errf(errbuf, errbuf_n, "orcac: method must not be empty");
     return -1;
   }
   if (orcac_validate_token("method", deck->method, errbuf, errbuf_n) != 0 ||

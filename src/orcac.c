@@ -292,6 +292,10 @@ static int load_settings(const OrcaCConfig *cfg_in, OrcacSettings *out,
       orcac_validate_blocks(cfg->blocks, err, err_n) != 0) {
     return ORCAC_E_INVALID;
   }
+  if (cfg->method != NULL && cfg->method[0] == '\0') {
+    orcac_errf(err, err_n, "orcac: method must not be empty");
+    return ORCAC_E_INVALID;
+  }
   st = resolve_exe(cfg->executable, exe, exe_n, err, err_n);
   if (st != ORCAC_OK) {
     return st;
@@ -805,7 +809,8 @@ static int evaluate(OrcaCSession *s, int n_atoms, const double *positions_ang,
   st = run_once(s, &paths, n_atoms, positions_ang, atomic_numbers, slot,
                 &parsed, &info);
   info.used_guess = slot >= 0;
-  if (st != ORCAC_OK && slot >= 0) {
+  if (st != ORCAC_OK && slot >= 0 &&
+      st != ORCAC_E_CANCELLED && st != ORCAC_E_TIMEOUT) {
     orcac_cache_drop(&s->guesses, s->dirs.guess, slot);
     if ((st == ORCAC_E_ERROR || st == ORCAC_E_NOT_CONVERGED) &&
         (s->settings.flags & ORCAC_F_NO_FRESH_RETRY) == 0) {

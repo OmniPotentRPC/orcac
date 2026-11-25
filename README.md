@@ -37,9 +37,12 @@ int orcac_probe_executable(const OrcaCConfig *config, char *resolved,
 ```
 
 Every call that can fail returns an `int` status and writes results through
-caller-owned out-parameters, which are written only on `ORCAC_OK`. No call
-returns a struct by value. `orcac_version` returns the library version as a
-static string, `orcac_c_abi_version` returns `RGPOT_ORCAC_C_ABI_VERSION` and
+caller-owned out-parameters. `energy_h` and `gradient_h_bohr` are written
+only on `ORCAC_OK`. `meta` is written on `ORCAC_OK` and on error statuses,
+except when `meta->struct_size` is below `ORCAC_RESULT_MIN_SIZE`; that
+returns `ORCAC_E_INVALID` and leaves `meta` untouched. No call returns a
+struct by value. `orcac_version` returns the library version as a static
+string, `orcac_c_abi_version` returns `RGPOT_ORCAC_C_ABI_VERSION` and
 `orcac_abi_version` returns `ORCAC_ABI_VERSION`.
 
 ### Status codes
@@ -96,7 +99,7 @@ into `reserved` or by appending fields. A NULL config selects the defaults.
 
 | Field | Meaning | Default |
 | --- | --- | --- |
-| `method` | method on the `!` line | `HF` |
+| `method` | method on the `!` line; `""` is invalid | `HF` |
 | `basis` | basis set on the `!` line; `""` omits it | `STO-3G` |
 | `keywords` | extra simple-input words, a single line | none |
 | `blocks` | user `%` blocks, validated | none |
