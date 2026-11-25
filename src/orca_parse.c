@@ -276,20 +276,136 @@ int orcac_parse_engrad(const char *text,
   return 0;
 }
 
+/* tolower without the locale, so only A-Z change. */
+static unsigned char ascii_lower(unsigned char c) {
+  return c >= 'A' && c <= 'Z' ? (unsigned char)(c - 'A' + 'a') : c;
+}
+
+/* Case-insensitive search for needle, given in lower case, in [line, end). */
+static int line_has(const char *line, const char *end, const char *needle) {
+  size_t n = strlen(needle);
+  for (const char *p = line; (size_t)(end - p) >= n; ++p) {
+    size_t i = 0;
+    while (i < n &&
+           ascii_lower((unsigned char)p[i]) == (unsigned char)needle[i]) {
+      ++i;
+    }
+    if (i == n) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* 1 when [line, end) is word, in any case, with only blanks around it. */
+static int line_is(const char *line, const char *end, const char *word) {
+  while (line < end && isspace((unsigned char)*line)) {
+    ++line;
+  }
+  while (end > line && isspace((unsigned char)end[-1])) {
+    --end;
+  }
+  return (size_t)(end - line) == strlen(word) && line_has(line, end, word);
+}
+
+/* ORCA echoes each input line as "|  12> text". */
+static int is_echo_line(const char *line, const char *end) {
+  const char *p = line;
+  while (p < end && *p == ' ') {
+    ++p;
+  }
+  if (p == end || *p != '|') {
+    return 0;
+  }
+  ++p;
+  while (p < end && *p == ' ') {
+    ++p;
+  }
+  if (p == end || !isdigit((unsigned char)*p)) {
+    return 0;
+  }
+  while (p < end && isdigit((unsigned char)*p)) {
+    ++p;
+  }
+  return p < end && *p == '>';
+}
+
+/* SCF failure banners of ORCA, counted on any line outside the echo. */
+static const char *const kScfBanners[] = {
+    "scf not converged after",
+    "error termination in scf",
+    "the scf has not converged",
+    "scf did not converge",
+    "this wavefunction is not converged",
+};
+
+/* Counted only inside the SCF iterations, before the SCF energy block. */
+static const char *const kScfRegionPhrases[] = {
+    "not yet converged",
+    "not fully converged",
+};
+
+#define N_OF(a) (sizeof(a) / sizeof((a)[0]))
+
+static int line_has_any(const char *line, const char *end,
+                        const char *const *needles, size_t n) {
+  for (size_t i = 0; i < n; ++i) {
+    if (line_has(line, end, needles[i])) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/*
+ * The input echo, from the "INPUT FILE" header to "****END OF INPUT****"
+ * and every "|  n>" line, is skipped, so a comment in the deck cannot
+ * read as a banner. Other "not converged" lines, such as a geometry
+ * optimisation's, do not count.
+ */
 int orcac_scf_not_converged(const char *text) {
-  static const char *const markers[] = {
-      "SCF NOT CONVERGED",
-      "SCF DID NOT CONVERGE",
-      "The SCF has not converged",
-      "error termination in SCF",
-  };
+  const char *line = text;
+  int in_input = 0;
+  int in_scf = 0;
   if (text == NULL) {
     return 0;
   }
-  for (size_t i = 0; i < sizeof(markers) / sizeof(markers[0]); ++i) {
-    if (strstr(text, markers[i]) != NULL) {
+  while (*line != '\0') {
+    const char *end = strchr(line, '\n');
+    const char *next;
+    if (end == NULL) {
+      end = line + strlen(line);
+    }
+    next = *end == '\n' ? end + 1 : end;
+    if (in_input) {
+      if (line_has(line, end, "****end of input****")) {
+        in_input = 0;
+      }
+      line = next;
+      continue;
+    }
+    if (line_is(line, end, "input file")) {
+      in_input = 1;
+      line = next;
+      continue;
+    }
+    if (is_echo_line(line, end)) {
+      line = next;
+      continue;
+    }
+    if (line_has_any(line, end, kScfBanners, N_OF(kScfBanners))) {
       return 1;
     }
+    if (line_has(line, end, "scf iterations")) {
+      in_scf = 1;
+    } else if (line_has(line, end, "total scf energy")) {
+      in_scf = 0;
+    }
+    if (in_scf &&
+        line_has_any(line, end, kScfRegionPhrases, N_OF(kScfRegionPhrases))) {
+      return 1;
+    }
+    line = next;
   }
   return 0;
 }

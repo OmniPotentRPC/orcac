@@ -376,6 +376,32 @@ int main(int argc, char **argv) {
     orcac_destroy(pot);
   }
 
+  /*
+   * Synthetic fixtures: banners in comments of the echoed input leave a
+   * converged run OK, and a partial convergence reported in the SCF
+   * block is NOT_CONVERGED even with exit status 0.
+   */
+  {
+    cfg = base_config(fake_bin, scratch);
+    cfg.guess_policy = ORCAC_GUESS_FRESH;
+    pot = make(&cfg);
+    if (pot == NULL) {
+      return fail("orcac_create for the SCF banner checks failed");
+    }
+    setenv("ORCAC_FAKE_STDOUT", "scf_echo_comment.stdout", 1);
+    st = eval(pot, &e, g, &meta);
+    if (check_replay(st, &meta, e, g) != 0) {
+      return fail("echoed input comment read as an SCF banner");
+    }
+    setenv("ORCAC_FAKE_STDOUT", "scf_not_fully_converged.stdout", 1);
+    st = eval(pot, &e, g, &meta);
+    unsetenv("ORCAC_FAKE_STDOUT");
+    if (st != ORCAC_E_NOT_CONVERGED || meta.exit_code != 0) {
+      return fail("partial SCF convergence not reported");
+    }
+    orcac_destroy(pot);
+  }
+
   /* A bad scratch_dir fails at create with a related message. */
   {
     char *bad = join(work, "missing/scratch");

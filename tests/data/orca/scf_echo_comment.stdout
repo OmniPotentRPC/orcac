@@ -1,0 +1,57 @@
+Synthetic orcac test fixture. Hand-written; not output of an ORCA run.
+                                 *****************
+                                 * O   R   C   A *
+                                 *****************
+
+================================================================================
+                                       INPUT FILE
+================================================================================
+NAME = orcac.inp
+|  1> # wavefunction not converged
+|  2> # SCF NOT CONVERGED AFTER 3 CYCLES in an earlier attempt
+|  3> # error termination in SCF, The SCF has not converged
+|  4> # SCF DID NOT CONVERGE; This wavefunction IS NOT CONVERGED!
+|  5> # SCF ITERATIONS were not yet converged, not fully converged
+|  6> ! HF STO-3G TightSCF EnGrad
+|  7> %scf ConvForced true end
+|  8> * xyz 0 1
+|  9> O 0.0 0.0 0.1173
+| 10> H 0.0 0.7572 -0.4692
+| 11> H 0.0 -0.7572 -0.4692
+| 12> *
+| 13>
+| 14>                          ****END OF INPUT****
+================================================================================
+
+--------------
+SCF ITERATIONS
+--------------
+ITER       Energy         Delta-E        Max-DP      RMS-DP      [F,P]     Damp
+  0    -75.4000000000   0.000000e+00  1.00e-02  1.00e-03  1.00e-02  0.700
+  1    -75.5000000000  -1.000000e-01  1.00e-05  1.00e-06  1.00e-05  0.700
+
+               *****************************************************
+               *                     SUCCESS                       *
+               *           SCF CONVERGED AFTER   2 CYCLES          *
+               *****************************************************
+
+----------------
+TOTAL SCF ENERGY
+----------------
+
+Total Energy       :          -75.50000000000000 Eh
+
+The optimization has not yet converged - more geometry cycles are needed
+
+------------------
+CARTESIAN GRADIENT
+------------------
+
+   1   O   :    0.020000000   -0.010000000    0.005000000
+   2   H   :   -0.015000000    0.012000000   -0.003000000
+   3   H   :   -0.005000000   -0.002000000   -0.002000000
+
+-------------------------   --------------------
+FINAL SINGLE POINT ENERGY       -75.500000000000
+-------------------------   --------------------
+ORCA TERMINATED NORMALLY

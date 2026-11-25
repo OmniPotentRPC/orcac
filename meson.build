@@ -96,6 +96,14 @@ if get_option('with_tests')
        args: [meson.current_source_dir()],
        timeout: 60)
 
+  test_parse = executable(
+    'test_orca_parse',
+    ['tests/test_orca_parse.c', 'src/orca_parse.c'],
+    include_directories: [inc, include_directories('src')],
+    c_args: common_c_args,
+  )
+  test('orca_parse', test_parse, args: [meson.current_source_dir()])
+
   test_real_optional = executable(
     'test_orca_real_optional',
     'tests/test_orca_real_optional.c',
