@@ -52,6 +52,50 @@ static void check_rejected(const struct ORCAParams *p, int n,
   free(msg);
 }
 
+/* Every coordinate in the deck reads back as the exact binary64 value the
+ * caller passed, including ones that ten fixed decimals would round. */
+static void check_coordinates_round_trip(void) {
+  const double coords[6] = {0.740000000021,
+                            0.0,
+                            1.2e-13,
+                            nextafter(0.740000000021, 1.0),
+                            -1.2345678901234567,
+                            19.314159265358979};
+  struct ORCAParams p = test_params_defaults();
+  p.method = test_text("HF");
+  p.basis = test_text("STO-3G");
+  size_t size = 0;
+  uint8_t *msg = test_encode_params(&p, &size);
+  char deck[4096];
+  size_t needed = 0;
+  CHECK(orcac_render_input(msg, size, 2, coords, k_h2_z, NULL, deck,
+                           sizeof(deck), &needed) == 0);
+  free(msg);
+  const char *data = strstr(deck, "* xyz 0 1\n");
+  CHECK(data != NULL);
+  if (!data)
+    return;
+  data += strlen("* xyz 0 1\n");
+  for (int i = 0; i < 2; ++i) {
+    char element[8];
+    int used = 0;
+    CHECK(sscanf(data, "%7s%n", element, &used) == 1);
+    CHECK(strcmp(element, "H") == 0);
+    data += used;
+    for (int j = 0; j < 3; ++j) {
+      char *end = NULL;
+      const double value = strtod(data, &end);
+      CHECK(end != data);
+      if (value != coords[3 * i + j]) {
+        fprintf(stderr, "coordinate %d of atom %d: wrote %.17g, read %.17g\n",
+                j, i, coords[3 * i + j], value);
+        ++g_failures;
+      }
+      data = end;
+    }
+  }
+}
+
 int main(int argc, char **argv) {
   if (argc != 2) {
     fprintf(stderr, "usage: %s GOLDEN_DIR\n", argv[0]);
@@ -88,6 +132,8 @@ int main(int argc, char **argv) {
   p.charge = 1;
   p.multiplicity = 2;
   check_golden(dir, "h2_cation_engrad_given.inp", &p, 2, k_h2, k_h2_z, NULL);
+
+  check_coordinates_round_trip();
 
   /* The deck does not depend on the host's LC_NUMERIC. */
   const char *comma_locales[] = {"de_DE.UTF-8", "de_DE.utf8", "fr_FR.UTF-8",
