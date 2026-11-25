@@ -5,7 +5,7 @@
 /*
  * Private per-session directory tree, all mode 0700:
  *
- *   <scratch>/orcac-XXXXXX/      root, from mkdtemp
+ *   <scratch>/orcac-<random>/    root, mkdirat in parent_fd
  *     run/                       one ORCA attempt; emptied before each
  *     guess/                     MORead guess slots
  *     keep/failed/               the most recent failed attempt

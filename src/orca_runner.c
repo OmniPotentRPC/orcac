@@ -125,6 +125,56 @@ int orcac_resolve_executable(const char *requested,
   return -1;
 }
 
+/* Name attempts before a crowded scratch directory wins. */
+#define ORCAC_RUN_DIR_TRIES 100
+#define ORCAC_RUN_DIR_SUFFIX 12
+
+static unsigned long long mix64(unsigned long long x) {
+  x += 0x9e3779b97f4a7c15ULL;
+  x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+  x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+  return x ^ (x >> 31);
+}
+
+/* Fill out with n random [A-Za-z0-9] characters and a NUL. */
+static void random_suffix(char *out, size_t n, unsigned int attempt) {
+  static const char kAlphabet[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  unsigned char bytes[ORCAC_RUN_DIR_SUFFIX];
+  size_t got = 0;
+  int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+  if (fd >= 0) {
+    while (got < n) {
+      ssize_t r = read(fd, bytes + got, n - got);
+      if (r < 0 && errno == EINTR) {
+        continue;
+      }
+      if (r <= 0) {
+        break;
+      }
+      got += (size_t)r;
+    }
+    close(fd);
+  }
+  if (got < n) {
+    struct timespec now;
+    unsigned long long x;
+    clock_gettime(CLOCK_REALTIME, &now);
+    x = mix64(((unsigned long long)now.tv_sec << 32) ^
+              (unsigned long long)now.tv_nsec ^
+              ((unsigned long long)getpid() << 16) ^ attempt ^
+              (unsigned long long)(size_t)out);
+    for (size_t i = got; i < n; ++i) {
+      x = mix64(x);
+      bytes[i] = (unsigned char)x;
+    }
+  }
+  for (size_t i = 0; i < n; ++i) {
+    out[i] = kAlphabet[bytes[i] % (sizeof(kAlphabet) - 1u)];
+  }
+  out[n] = '\0';
+}
+
 int orcac_make_run_dir(const char *scratch_root,
                        int *parent_fd_out,
                        int *dir_fd_out,
@@ -132,13 +182,13 @@ int orcac_make_run_dir(const char *scratch_root,
                        size_t run_dir_n,
                        char *errbuf,
                        size_t errbuf_n) {
-  char pattern[4096];
+  char name[sizeof("orcac-") + ORCAC_RUN_DIR_SUFFIX];
   const char *root = scratch_root;
-  const char *name;
   struct stat st;
   struct stat entry;
   int parent_fd;
   int fd;
+  int made = 0;
   if (run_dir == NULL || run_dir_n == 0 || parent_fd_out == NULL ||
       dir_fd_out == NULL) {
     return -1;
@@ -151,9 +201,7 @@ int orcac_make_run_dir(const char *scratch_root,
       root = "/tmp";
     }
   }
-  if (snprintf(pattern, sizeof(pattern), "%s/orcac-XXXXXX", root) >=
-          (int)sizeof(pattern) ||
-      strlen(pattern) >= run_dir_n) {
+  if (strlen(root) + 1u + sizeof(name) > run_dir_n) {
     orcac_errf(errbuf, errbuf_n, "orcac: scratch directory path too long");
     return -1;
   }
@@ -163,17 +211,29 @@ int orcac_make_run_dir(const char *scratch_root,
                "%s: %s", root, strerror(errno));
     return -1;
   }
-  if (mkdtemp(pattern) == NULL) {
+  memcpy(name, "orcac-", sizeof("orcac-") - 1u);
+  for (unsigned int attempt = 0; attempt < ORCAC_RUN_DIR_TRIES; ++attempt) {
+    random_suffix(name + sizeof("orcac-") - 1u, ORCAC_RUN_DIR_SUFFIX,
+                  attempt);
+    if (mkdirat(parent_fd, name, 0700) == 0) {
+      made = 1;
+      break;
+    }
+    if (errno != EEXIST) {
+      break;
+    }
+  }
+  if (!made) {
     orcac_errf(errbuf, errbuf_n,
-               "orcac: could not create scratch directory: %s",
+               "orcac: could not create scratch directory in %s: %s", root,
                strerror(errno));
     close(parent_fd);
     return -1;
   }
-  name = strrchr(pattern, '/') + 1;
+  snprintf(run_dir, run_dir_n, "%s/%s", root, name);
   /*
-   * mkdtemp works by path, so check that the entry the pinned parent
-   * holds is the private directory it made and not one swapped in.
+   * Between mkdirat and openat the entry could be swapped, so check
+   * that what the pinned parent holds is the private directory made.
    */
   fd = openat(parent_fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   if (fd < 0 || fstat(fd, &st) != 0 ||
@@ -182,14 +242,14 @@ int orcac_make_run_dir(const char *scratch_root,
       st.st_uid != geteuid() || (st.st_mode & 077) != 0) {
     orcac_errf(errbuf, errbuf_n,
                "orcac: scratch directory %s changed before it was opened",
-               pattern);
+               run_dir);
     if (fd >= 0) {
       close(fd);
     }
     close(parent_fd);
+    run_dir[0] = '\0';
     return -1;
   }
-  copy_path(run_dir, run_dir_n, pattern);
   *parent_fd_out = parent_fd;
   *dir_fd_out = fd;
   return 0;

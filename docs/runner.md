@@ -58,8 +58,8 @@ is retried.
 
 ## Files
 
-Each session owns one directory, created with `mkdtemp` as
-`orcac-XXXXXX` under `scratch_dir` (else `$TMPDIR`, else `/tmp`). The
+Each session owns one directory, `orcac-` and twelve random letters and
+digits, under `scratch_dir` (else `$TMPDIR`, else `/tmp`). The
 session directory and its subdirectories are mode 0700:
 
 | Path | Contents |
@@ -83,8 +83,9 @@ When `orcac_destroy` cannot remove the tree, `orcac_last_error(NULL)`
 names the directory and the reason; after a clean destroy it is empty.
 
 Nothing in the session is reached by path. The scratch directory is
-opened first and stays pinned; `mkdtemp` makes the root, which is then
-opened through the pinned parent with `O_DIRECTORY | O_NOFOLLOW` and
+opened first and stays pinned; `mkdirat` makes the root relative to
+it, trying fresh random names while the name is taken, and the root is
+then opened through the pinned parent with `O_DIRECTORY | O_NOFOLLOW` and
 must be that entry, owned by the caller and mode 0700. `run/` and
 `guess/` are pinned the same way, and `run/` again each time it is
 recreated. The deck and ORCA's stdout and stderr are created with

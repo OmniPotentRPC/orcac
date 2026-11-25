@@ -279,6 +279,69 @@ static void test_host_locale(void) {
   setlocale(LC_NUMERIC, saved);
 }
 
+/* "orcac-" and twelve letters or digits. */
+static int run_dir_name_ok(const char *name) {
+  if (strncmp(name, "orcac-", 6u) != 0 || strlen(name) != 18u) {
+    return 0;
+  }
+  for (const char *p = name + 6; *p != '\0'; ++p) {
+    if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+          (*p >= '0' && *p <= '9'))) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+/*
+ * Session directories are made with mkdirat in the pinned scratch
+ * directory under fresh random names, private to the caller, and
+ * reported under the scratch path.
+ */
+static void test_make_run_dir(const char *scratch) {
+  char path[2][4096];
+  int parent_fd[2] = {-1, -1};
+  int dir_fd[2] = {-1, -1};
+  char err[256];
+  struct stat by_fd;
+  struct stat by_path;
+  struct stat parent;
+  struct stat scratch_st;
+
+  for (int i = 0; i < 2; ++i) {
+    CHECK(orcac_make_run_dir(scratch, &parent_fd[i], &dir_fd[i], path[i],
+                             sizeof(path[i]), err, sizeof(err)) == 0,
+          "make a session directory");
+  }
+  if (dir_fd[0] < 0 || dir_fd[1] < 0) {
+    return;
+  }
+  for (int i = 0; i < 2; ++i) {
+    const char *slash = strrchr(path[i], '/');
+    CHECK(slash != NULL && (size_t)(slash - path[i]) == strlen(scratch) &&
+              strncmp(path[i], scratch, strlen(scratch)) == 0 &&
+              run_dir_name_ok(slash + 1),
+          "session directory name");
+    CHECK(fstat(dir_fd[i], &by_fd) == 0 && stat(path[i], &by_path) == 0 &&
+              by_fd.st_ino == by_path.st_ino &&
+              by_fd.st_dev == by_path.st_dev &&
+              (by_fd.st_mode & 0777) == 0700 && by_fd.st_uid == geteuid(),
+          "session directory is the private entry made");
+    CHECK(fstat(parent_fd[i], &parent) == 0 &&
+              stat(scratch, &scratch_st) == 0 &&
+              parent.st_ino == scratch_st.st_ino,
+          "pinned parent is the scratch directory");
+  }
+  CHECK(strcmp(path[0], path[1]) != 0, "two sessions share a name");
+  for (int i = 0; i < 2; ++i) {
+    CHECK(unlinkat(parent_fd[i], strrchr(path[i], '/') + 1, AT_REMOVEDIR) ==
+              0,
+          "remove the session directory");
+    close(dir_fd[i]);
+    close(parent_fd[i]);
+  }
+}
+
 static void write_file(const char *path, const char *text) {
   FILE *fp = fopen(path, "wb");
   if (fp == NULL) {
@@ -949,6 +1012,7 @@ int main(int argc, char **argv) {
   test_cache_eviction(scratch);
   test_cancel_window(fake_bin, scratch);
   test_pinned_run_files(fake_bin, scratch);
+  test_make_run_dir(scratch);
   CHECK(entry_count(scratch) == 0, "scratch directory left non-empty");
   rmdir(scratch);
   test_remove_tree();

@@ -32,12 +32,13 @@ int orcac_resolve_executable(const char *requested,
                              size_t errbuf_n);
 
 /*
- * Make a private orcac-XXXXXX directory under scratch_root (NULL or ""
+ * Make a private orcac-<random> directory under scratch_root (NULL or ""
  * uses $TMPDIR, then /tmp). The scratch directory is opened first and
- * stays pinned in *parent_fd_out; the new directory is opened through it
- * with O_NOFOLLOW into *dir_fd_out and must be the entry the parent
- * holds, owned by this user and mode 0700. run_dir gets its path, for
- * messages only.
+ * stays pinned in *parent_fd_out; the new directory is made with mkdirat
+ * relative to it, under a fresh random name while names are taken, and
+ * opened through it with O_NOFOLLOW into *dir_fd_out and must be the
+ * entry the parent holds, owned by this user and mode 0700. run_dir gets
+ * its path, for messages only.
  */
 int orcac_make_run_dir(const char *scratch_root,
                        int *parent_fd_out,
