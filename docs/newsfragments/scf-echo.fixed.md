@@ -1,0 +1,1 @@
+A comment in a verbatim `keywords` block that reads like an SCF failure, such as `# SCF NOT CONVERGED`, no longer fails a converged step: SCF failure detection skips ORCA's echo of the input, from `INPUT FILE` to `****END OF INPUT****` and every `|  n>` line.

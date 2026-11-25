@@ -63,11 +63,24 @@ int main(int argc, char **argv) {
   CHECK_NEAR(g[0], 0.0, 1e-6);
   CHECK_NEAR(g[1], 0.0, 1e-6);
 
+  const double e1 = r.energy_h;
+  double g1[6];
+  memcpy(g1, g, sizeof(g1));
+
   /* The next step reads the stored orbitals. */
   const double pos2[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.75};
   r = orcac_session_energy_gradient(s, 2, pos2, z, g);
   CHECK(r.ok == 1);
   CHECK(r.reused_orbitals == 1);
+
+  /* Back at the first geometry from those orbitals, ORCA must land on the
+   * first answer: within 1 cm^-1 (4.6e-6 Eh) and 1e-4 Eh/bohr. */
+  r = orcac_session_energy_gradient(s, 2, pos, z, g);
+  CHECK(r.ok == 1);
+  CHECK(r.reused_orbitals == 1);
+  CHECK_NEAR(r.energy_h, e1, 4.6e-6);
+  for (int k = 0; k < 6; ++k)
+    CHECK_NEAR(g[k], g1[k], 1e-4);
   orcac_session_destroy(s);
   return test_finish_main("live_orca");
 }

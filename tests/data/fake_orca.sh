@@ -5,6 +5,7 @@
 # Environment knobs (all optional):
 #   ORCAC_FAKE_ENGRAD       .engrad fixture copied to <base>.engrad
 #   ORCAC_FAKE_LOG          append the received input and cwd here
+#   ORCAC_FAKE_ECHO_INPUT   echo the input to stdout the way ORCA frames it
 #   ORCAC_FAKE_STDOUT       file copied to stdout before exit
 #   ORCAC_FAKE_SCF_FAIL     print an unconverged-SCF report, exit 1
 #   ORCAC_FAKE_SCF_FAIL_EXIT0  same report, exit 0 with an .engrad
@@ -50,6 +51,15 @@ if [ -n "${ORCAC_FAKE_SLEEP:-}" ]; then
 fi
 echo "fake orca stderr line" >&2
 
+if [ "${ORCAC_FAKE_ECHO_INPUT:-}" = 1 ]; then
+  echo "================================================================================"
+  echo "                                       INPUT FILE"
+  echo "================================================================================"
+  echo "NAME = $inp"
+  awk '{ printf "|%3d> %s\n", NR, $0 }
+       END { printf "|%3d>                          ****END OF INPUT****\n", NR + 1 }' "$inp"
+  echo "================================================================================"
+fi
 if [ -n "${ORCAC_FAKE_STDOUT:-}" ]; then
   cat "$ORCAC_FAKE_STDOUT"
 fi

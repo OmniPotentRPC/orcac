@@ -24,7 +24,7 @@ parameter messages, units, executable lookup and `ORCAC_LIBRARY` /
 | input | `! <method> <basis> <keywords> EnGrad`, then `! MORead` and `%moinp` when orbitals are reused, `%pal nprocs` when `nprocs` > 1, `%maxcore`, a verbatim block when `keywords` starts with `!` or `%` or spans lines, and `* xyz charge multiplicity` in Angstrom |
 | run | `orca orcac.inp` in a private `mkdtemp` directory, stdout and stderr to files, stdin from `/dev/null`, a new process group |
 | timeout | `timeoutS` (default 3600 s, 0 waits without a limit): SIGTERM to the group, SIGKILL two seconds later if anything is left, then reaped |
-| failure | non-zero exit, a signal, an unconverged SCF (detected in the output even at exit 0), a missing or malformed `.engrad`, or atomic numbers that differ from the input; the message carries the tails of stderr and of the output |
+| failure | non-zero exit, a signal, an unconverged SCF (detected in the output even at exit 0, outside ORCA's echo of the input), a missing or malformed `.engrad`, or atomic numbers that differ from the input; the message carries the tails of stderr and of the output |
 | orbitals | after a success the `.gbw` is kept and the next step with the same atoms reads it (`restart`, default on); a failed `MORead` step is retried once from ORCA's own guess |
 | numbers | written and read in the C locale whatever `LC_NUMERIC` the host set; each coordinate is the shortest text that reads back as the same double, so ORCA sees exactly the geometry it was given |
 
@@ -133,7 +133,14 @@ meson test -C build
 Needs a C11 compiler, meson, ninja and `capnp` (the Cap'n Proto compiler;
 the C runtime and code generator are vendored). With Pixi: `pixi run test`.
 No ORCA is needed to build or to run the suite; `live_orca` is the one test
-that runs ORCA and it is reported as skipped without one.
+that runs ORCA and it is reported as skipped without one. The comma-decimal
+locale checks skip when no `de_DE` or `fr_FR` locale is installed;
+`ORCAC_REQUIRE_COMMA_LOCALE=1` makes that a failure instead.
+
+A sanitizer build (`-Db_sanitize=address,undefined -Db_lundef=false`, or
+`pixi run test-sanitize`) needs meson 1.4 or newer. Older releases ignore
+the `b_sanitize=none` override on the vendored c-capnproto runtime, whose
+known undefined behaviour then fails `config_capnp`.
 
 Install header, library and `orcac.pc` (`soversion` 1):
 

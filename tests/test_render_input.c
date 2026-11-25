@@ -136,20 +136,15 @@ int main(int argc, char **argv) {
   check_coordinates_round_trip();
 
   /* The deck does not depend on the host's LC_NUMERIC. */
-  const char *comma_locales[] = {"de_DE.UTF-8", "de_DE.utf8", "fr_FR.UTF-8",
-                                 "fr_FR.utf8"};
-  for (size_t i = 0; i < sizeof(comma_locales) / sizeof(comma_locales[0]);
-       ++i) {
-    if (setlocale(LC_NUMERIC, comma_locales[i])) {
-      printf("rendering under %s\n", comma_locales[i]);
-      p = test_params_defaults();
-      p.method = test_text("HF");
-      p.basis = test_text("def2-SVP");
-      p.keywords = test_text("TightSCF");
-      check_golden(dir, "h2_minimal.inp", &p, 2, k_h2, k_h2_z, NULL);
-      setlocale(LC_NUMERIC, "C");
-      break;
-    }
+  const char *comma = test_comma_locale();
+  if (comma) {
+    printf("rendering under %s\n", comma);
+    p = test_params_defaults();
+    p.method = test_text("HF");
+    p.basis = test_text("def2-SVP");
+    p.keywords = test_text("TightSCF");
+    check_golden(dir, "h2_minimal.inp", &p, 2, k_h2, k_h2_z, NULL);
+    setlocale(LC_NUMERIC, "C");
   }
 
   /* Configurations that cannot run are refused before any process starts. */

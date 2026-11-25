@@ -9,6 +9,7 @@
 #include "orcac.h"
 #include "potential.capnp.h"
 
+#include <locale.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -176,6 +177,29 @@ TEST_HELPER static char *test_path(const char *dir, const char *name) {
   char *out = malloc(n);
   snprintf(out, n, "%s/%s", dir, name);
   return out;
+}
+
+/* Switch LC_NUMERIC to an installed locale whose decimal point is ',' and
+ * return its name; the caller restores "C". NULL when there is none: a
+ * skip, or a failure when ORCAC_REQUIRE_COMMA_LOCALE is 1. */
+TEST_HELPER static const char *test_comma_locale(void) {
+  static const char *const names[] = {"de_DE.UTF-8", "de_DE.utf8",
+                                      "fr_FR.UTF-8", "fr_FR.utf8"};
+  for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+    if (setlocale(LC_NUMERIC, names[i]) &&
+        strcmp(localeconv()->decimal_point, ",") == 0)
+      return names[i];
+  }
+  setlocale(LC_NUMERIC, "C");
+  const char *required = getenv("ORCAC_REQUIRE_COMMA_LOCALE");
+  if (required && strcmp(required, "1") == 0) {
+    fprintf(stderr, "no comma-decimal locale is installed and "
+                    "ORCAC_REQUIRE_COMMA_LOCALE is 1\n");
+    ++g_failures;
+  } else {
+    printf("no comma-decimal locale is installed; skipping that check\n");
+  }
+  return NULL;
 }
 
 TEST_HELPER static int test_finish_main(const char *name) {

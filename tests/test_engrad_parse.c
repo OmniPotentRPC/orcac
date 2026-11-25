@@ -64,16 +64,11 @@ int main(int argc, char **argv) {
   free(extra);
 
   /* Parsing does not depend on LC_NUMERIC. */
-  const char *comma_locales[] = {"de_DE.UTF-8", "de_DE.utf8", "fr_FR.UTF-8",
-                                 "fr_FR.utf8"};
-  for (size_t i = 0; i < sizeof(comma_locales) / sizeof(comma_locales[0]);
-       ++i) {
-    if (setlocale(LC_NUMERIC, comma_locales[i])) {
-      printf("parsing under %s\n", comma_locales[i]);
-      check_water(water, strlen(water));
-      setlocale(LC_NUMERIC, "C");
-      break;
-    }
+  const char *comma = test_comma_locale();
+  if (comma) {
+    printf("parsing under %s\n", comma);
+    check_water(water, strlen(water));
+    setlocale(LC_NUMERIC, "C");
   }
 
   /* The hand-written two-atom fixture (comment preamble before the
