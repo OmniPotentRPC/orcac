@@ -13,6 +13,7 @@
 #ifdef ORCAC_TEST_HOOKS
 void (*orcac_test_after_keep)(int root_fd) = NULL;
 void (*orcac_test_before_keep)(int root_fd, int keep_fd) = NULL;
+void (*orcac_test_after_move)(int root_fd, int keep_fd) = NULL;
 int (*orcac_test_remove_fail)(const OrcacSessionDirs *dirs) = NULL;
 int (*orcac_test_paths_fail)(int parent_fd, const char *root_name) = NULL;
 int orcac_test_alloc_fail = 0;
@@ -279,13 +280,20 @@ static int keep_pinned(const OrcacSessionDirs *dirs) {
 }
 
 /*
- * renameat cannot name an inode, so keep/ can still leave the root
- * between the last check and the rename and take the files with it;
- * the check afterwards sees that and moves them back into the root.
+ * renameat cannot name an inode, so between the last check and the
+ * rename run/ can be swapped, and the rename then takes the decoy, or
+ * keep/ can leave the root and take the files with it. Both ends are
+ * checked by device and inode after the rename, and anything it should
+ * not have moved goes back to the root's run entry through the held
+ * keep_fd, wherever keep/ now is. When that move back fails, its error
+ * is the result, never EXDEV, which promises that nothing left the
+ * root; so is EIO when the files moved back are no longer run/.
  */
 static int move_run_to_keep(OrcacSessionDirs *dirs) {
   int root_fd = dirs->root_fd;
   int keep_fd = dirs->keep_fd;
+  int took_run;
+  int keep_in_root;
   if (!keep_pinned(dirs)) {
     errno = EXDEV;
     return -1;
@@ -305,15 +313,28 @@ static int move_run_to_keep(OrcacSessionDirs *dirs) {
   if (renameat(root_fd, "run", keep_fd, "failed") != 0) {
     return -1;
   }
-  if (!entry_is_fd(root_fd, "keep", keep_fd) ||
-      !entry_is_fd(keep_fd, "failed", dirs->run_fd)) {
-    if (entry_is_fd(keep_fd, "failed", dirs->run_fd)) {
-      (void)renameat(keep_fd, "failed", root_fd, "run");
+#ifdef ORCAC_TEST_HOOKS
+  if (orcac_test_after_move != NULL) {
+    orcac_test_after_move(root_fd, keep_fd);
+  }
+#endif
+  took_run = entry_is_fd(keep_fd, "failed", dirs->run_fd);
+  keep_in_root = entry_is_fd(root_fd, "keep", keep_fd);
+  if (took_run && keep_in_root) {
+    return 0;
+  }
+  if (renameat(keep_fd, "failed", root_fd, "run") != 0) {
+    if (errno == EXDEV) {
+      errno = EIO;
     }
-    errno = EXDEV;
     return -1;
   }
-  return 0;
+  if (took_run && !entry_is_fd(root_fd, "run", dirs->run_fd)) {
+    errno = EIO;
+    return -1;
+  }
+  errno = EXDEV;
+  return -1;
 }
 
 int orcac_session_keep_run(OrcacSessionDirs *dirs) {

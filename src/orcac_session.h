@@ -68,9 +68,14 @@ int orcac_session_reset_run(OrcacSessionDirs *dirs, char *errbuf,
  * made only while the root's entries run and keep are still run_fd and
  * keep_fd, by device and inode: a keep/ or run/ renamed away, or
  * replaced by a symlink or another directory, is -1 with EXDEV and
- * nothing moves. If keep/ leaves the root between that check and the
- * rename, the files are moved back to run/ and the result is -1 with
- * EXDEV.
+ * nothing moves. After the rename keep/failed must be run_fd and the
+ * root's keep entry keep_fd. If run/ was swapped between that check and
+ * the rename, what the rename took goes back to the root's run entry;
+ * if keep/ left the root, the files are moved back to run/ through
+ * keep_fd. Either is -1 with EXDEV once the move back is done. When it
+ * fails, the result is -1 with its error, never EXDEV, and the files
+ * stay wherever keep/ went; when the files moved back are no longer the
+ * root's run entry, the result is -1 with EIO.
  */
 int orcac_session_keep_run(OrcacSessionDirs *dirs);
 
@@ -82,6 +87,11 @@ extern void (*orcac_test_after_keep)(int root_fd);
  * keep/, right before the renameat.
  */
 extern void (*orcac_test_before_keep)(int root_fd, int keep_fd);
+/*
+ * Called by orcac_session_keep_run right after its renameat succeeds,
+ * before the identity checks that follow it.
+ */
+extern void (*orcac_test_after_move)(int root_fd, int keep_fd);
 /*
  * Asked by orcac_session_remove and orcac_session_close before they
  * remove anything; a nonzero errno value fails the removal with it and

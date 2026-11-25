@@ -1401,6 +1401,134 @@ static void test_keep_moved_in_window(const char *scratch) {
   CHECK(entry_count(scratch) == before, "scratch not back to its entries");
 }
 
+static char run_race_to[PATH_MAX + 32];
+static int run_race_calls = 0;
+
+/*
+ * In the window before the renameat, move run/ out of the root and put
+ * a decoy run/ holding a file named decoy in its place.
+ */
+static void swap_run_out(int root_fd, int keep_fd) {
+  int fd;
+  (void)keep_fd;
+  ++run_race_calls;
+  CHECK(renameat(root_fd, "run", AT_FDCWD, run_race_to) == 0 &&
+            mkdirat(root_fd, "run", 0700) == 0,
+        "swap run/ for a decoy before the rename");
+  fd = openat(root_fd, "run/decoy", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+              0600);
+  CHECK(fd >= 0, "fill the decoy run/");
+  if (fd >= 0) {
+    close(fd);
+  }
+}
+
+/*
+ * run/ swapped between the last check and the renameat makes the rename
+ * take the decoy into keep/failed; keep_run sees that keep/failed is
+ * not run_fd, puts the decoy back as run/, leaves keep/ empty and fails
+ * with EXDEV.
+ */
+static void test_keep_run_swapped_in_window(const char *scratch) {
+  OrcacSessionDirs dirs;
+  char err[256];
+  char keep[PATH_MAX + 32];
+  char path[PATH_MAX + 64];
+  int before = entry_count(scratch);
+
+  CHECK(orcac_session_open(scratch, &dirs, err, sizeof(err)) == 0,
+        "open for the run/ race");
+  if (dirs.root == NULL) {
+    return;
+  }
+  snprintf(run_race_to, sizeof(run_race_to), "%s/run-out", scratch);
+  snprintf(keep, sizeof(keep), "%s/keep", dirs.root);
+  snprintf(path, sizeof(path), "%s/marker", dirs.run);
+  write_file(path, "marker");
+  run_race_calls = 0;
+  orcac_test_before_keep = swap_run_out;
+  errno = 0;
+  CHECK(orcac_session_keep_run(&dirs) != 0 && errno == EXDEV,
+        "decoy run/ kept, or not refused with EXDEV");
+  orcac_test_before_keep = NULL;
+  CHECK(run_race_calls == 1, "run/ race hook not called");
+  CHECK(entry_count(keep) == 0, "decoy run/ left in keep/failed");
+  snprintf(path, sizeof(path), "%s/decoy", dirs.run);
+  CHECK(access(path, F_OK) == 0, "decoy not put back as run/");
+  CHECK(file_is(run_race_to, "marker", "marker"),
+        "swapped-out run/ touched by the rollback");
+  CHECK(orcac_session_close(&dirs, err, sizeof(err)) == 0,
+        "close after the run/ race");
+  remove_by_path(scratch, "run-out");
+  CHECK(entry_count(scratch) == before, "scratch not back to its entries");
+}
+
+static int blocked_calls = 0;
+
+/*
+ * Right after the renameat, move keep/ out of the root and fill the
+ * root's run entry, so the files cannot be moved back.
+ */
+static void move_keep_out_and_block(int root_fd, int keep_fd) {
+  int fd;
+  (void)keep_fd;
+  ++blocked_calls;
+  CHECK(renameat(root_fd, "keep", AT_FDCWD, keep_race_to) == 0 &&
+            mkdirat(root_fd, "run", 0700) == 0,
+        "move keep/ out and block run/ after the rename");
+  fd = openat(root_fd, "run/blocker", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+              0600);
+  CHECK(fd >= 0, "fill the blocking run/");
+  if (fd >= 0) {
+    close(fd);
+  }
+}
+
+/*
+ * keep/ leaving the root right after the renameat, with the move back
+ * refused, leaves the files outside the session tree: keep_run fails
+ * with the error of the move back, never EXDEV or success.
+ */
+static void test_keep_restore_fails(const char *scratch) {
+  OrcacSessionDirs dirs;
+  char err[256];
+  char failed[PATH_MAX + 48];
+  char path[PATH_MAX + 64];
+  int before = entry_count(scratch);
+  int rc;
+  int got;
+
+  CHECK(orcac_session_open(scratch, &dirs, err, sizeof(err)) == 0,
+        "open for the blocked move back");
+  if (dirs.root == NULL) {
+    return;
+  }
+  snprintf(keep_race_to, sizeof(keep_race_to), "%s/keep-out", scratch);
+  snprintf(failed, sizeof(failed), "%s/failed", keep_race_to);
+  snprintf(path, sizeof(path), "%s/marker", dirs.run);
+  write_file(path, "marker");
+  blocked_calls = 0;
+  orcac_test_after_move = move_keep_out_and_block;
+  errno = 0;
+  rc = orcac_session_keep_run(&dirs);
+  got = errno;
+  orcac_test_after_move = NULL;
+  CHECK(blocked_calls == 1, "after-move hook not called");
+  CHECK(rc != 0, "escaped run reported as kept");
+  CHECK(got != EXDEV && got != 0,
+        "escaped run reported as EXDEV or without an error");
+  CHECK(got == ENOTEMPTY || got == EEXIST,
+        "error of the refused move back not propagated");
+  CHECK(file_is(failed, "marker", "marker"),
+        "escaped run files not where keep/ went");
+  snprintf(path, sizeof(path), "%s/blocker", dirs.run);
+  CHECK(access(path, F_OK) == 0, "blocking run/ replaced");
+  CHECK(orcac_session_close(&dirs, err, sizeof(err)) == 0,
+        "close after the blocked move back");
+  remove_by_path(scratch, "keep-out");
+  CHECK(entry_count(scratch) == before, "scratch not back to its entries");
+}
+
 /*
  * With allocation failing for good from the kth path allocation of
  * orcac_session_open on, the new root is still removed: undoing it
@@ -1925,6 +2053,8 @@ int main(int argc, char **argv) {
   test_session_close_renamed(scratch);
   test_keep_replaced(scratch);
   test_keep_moved_in_window(scratch);
+  test_keep_run_swapped_in_window(scratch);
+  test_keep_restore_fails(scratch);
   test_session_alloc_stuck(scratch);
   test_configure_cleanup_fails(fake_bin, scratch);
   test_configure_rollback_fails(fake_bin, scratch);

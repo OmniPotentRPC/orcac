@@ -104,9 +104,17 @@ time it is recreated. A failed run moves to `keep/failed` with one
 while the root's `run` and `keep` entries are still those descriptors
 by device and inode; a `keep/` renamed away or replaced by a symlink or
 another directory gets nothing, the call fails with `EXDEV` and the
-files stay in `run/`. If `keep/` leaves the root in the window between
-that check and the rename, the check after it sees the move and puts
-the files back in `run/`. The deck and ORCA's stdout and stderr are created with
+files stay in `run/`. `renameat` cannot name an inode, so after the
+rename `keep/failed` must be the pinned `run/` and the root's `keep`
+entry the pinned `keep/`, again by device and inode. If `run/` was
+swapped in the window between the last check and the rename, the decoy
+the rename took goes back to the root's `run` entry; if `keep/` left
+the root, the files are moved back to `run/` through the held `keep/`
+descriptor, wherever it went. Either fails with `EXDEV` once the move
+back is done. When the move back fails, the call fails with that
+error, never with `EXDEV`, and the files stay wherever `keep/` went;
+when the files moved back are no longer the root's `run/`, it fails
+with `EIO`. The deck and ORCA's stdout and stderr are created with
 `openat(..., O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC)` in the pinned
 `run/`, ORCA starts there through `fchdir`, and its outputs, the `.gbw`
 stored as a guess included, are read with `O_NOFOLLOW` and must be
