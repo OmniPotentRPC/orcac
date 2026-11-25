@@ -94,18 +94,25 @@ recreated. The deck and ORCA's stdout and stderr are created with
 stored as a guess included, are read with `O_NOFOLLOW` and must be
 regular files. Guess slots are copied, renamed and removed relative to
 `guess/`. Replacing the root or any directory above it in a writable
-scratch directory therefore cannot redirect or truncate a file, and
-`orcac_destroy` removes the root's entry from the pinned parent only
-while that entry is still the pinned root. The remover opens each entry relative to its parent with
-`O_NOFOLLOW`, reads it through `fdopendir` and removes it with
-`unlinkat`. Before each descent and each `unlinkat` it follows `..` from
-the directory it is working in back to the pinned session root and
-compares device and inode at the exact expected depth. A symlink is
-unlinked itself, a directory swapped for a symlink during the walk is
-never entered, and a directory on another device, or one whose parent
-or any further ancestor was moved out of the session tree, is left in
-place and reported with `EXDEV`, so the walk cannot leave the session
-root.
+scratch directory therefore cannot redirect or truncate a file.
+`orcac_destroy`, and `orcac_session_open` when it fails after making
+the root, remove the root's entry from the pinned parent only while that
+entry is still the pinned root. A new root that fails its checks is
+removed again only while it is still the empty directory that was made.
+
+The remover pins a descriptor for every level from the session root
+down. Each level is opened from its pinned parent with
+`O_DIRECTORY | O_NOFOLLOW` and read through `fdopendir`. Every
+`openat`, `fstatat` and `unlinkat` is relative to one of those
+descriptors, and `..` is never followed. Before each descent and each
+`unlinkat`, every pinned level must still be the entry, by device and
+inode, that its pinned parent holds under the name it was opened by. A
+symlink is unlinked itself and a directory swapped for a symlink during
+the walk is never entered. A directory on another device, or one that
+it or any ancestor was renamed away from, is left in place and reported
+with `EXDEV`. A rename in the window between that check and the
+`unlinkat` still cannot point the `unlinkat` at a different directory.
+It always acts on the pinned directory that was just checked.
 
 ## Results
 
