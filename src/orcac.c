@@ -1,12 +1,22 @@
 #include <orcac.h>
 
+#include "orca_input.h"
+#include "orca_parse.h"
+#include "orca_runner.h"
 #include "orcac_errbuf.h"
 #include "orcac_internal.h"
 
+#include <errno.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+/* Leaves room for both tails in last_error after a short leading error. */
+#define ORCAC_TAIL_BYTES 1536
 
 #ifndef ORCAC_VERSION_STRING
 #define ORCAC_VERSION_STRING "0.1.0"
@@ -25,6 +35,43 @@ static char *dup_string(const char *src) {
   }
   memcpy(out, src, n + 1);
   return out;
+}
+
+static int safe_unlink(const char *path) {
+  if (unlink(path) != 0 && errno != ENOENT) {
+    return -1;
+  }
+  return 0;
+}
+
+static char *join_path2(const char *a, const char *b) {
+  size_t na = strlen(a);
+  size_t nb = strlen(b);
+  char *out = (char *)malloc(na + nb + 2u);
+  if (out == NULL) {
+    return NULL;
+  }
+  memcpy(out, a, na);
+  out[na] = '/';
+  memcpy(out + na + 1u, b, nb + 1u);
+  return out;
+}
+
+static int write_text_file(const char *path, const char *text, char *errbuf,
+                           size_t errbuf_n) {
+  FILE *fp = fopen(path, "wb");
+  if (fp == NULL) {
+    orcac_errf(errbuf, errbuf_n, "orcac: could not write %s: %s",
+               path, strerror(errno));
+    return -1;
+  }
+  if (fputs(text, fp) == EOF || fflush(fp) != 0) {
+    fclose(fp);
+    orcac_errf(errbuf, errbuf_n, "orcac: write failed for %s", path);
+    return -1;
+  }
+  fclose(fp);
+  return 0;
 }
 
 static void copy_text(char *dst, size_t dst_n, const char *src) {
@@ -126,6 +173,21 @@ int orcac_copy_config(OrcaCConfig *dst, const OrcaCConfig *src,
   return 0;
 }
 
+static int refresh_resolved_exe(OrcaCPot *pot) {
+  char buf[4096];
+  if (orcac_resolve_executable(pot->config.orca_bin, buf, sizeof(buf),
+                               pot->last_error, sizeof(pot->last_error)) != 0) {
+    return -1;
+  }
+  free(pot->resolved_exe);
+  pot->resolved_exe = dup_string(buf);
+  if (pot->resolved_exe == NULL) {
+    orcac_set_error(pot, "orcac: out of memory while storing executable path");
+    return -1;
+  }
+  return 0;
+}
+
 OrcaCPot *orcac_create(const OrcaCConfig *config) {
   OrcaCPot *pot = (OrcaCPot *)calloc(1, sizeof(*pot));
   if (pot == NULL) {
@@ -136,6 +198,13 @@ OrcaCPot *orcac_create(const OrcaCConfig *config) {
     free(pot);
     return NULL;
   }
+  pot->resolved_exe = dup_string(pot->config.orca_bin);
+  if (pot->resolved_exe == NULL) {
+    orcac_free_config(&pot->config);
+    free(pot);
+    return NULL;
+  }
+  pot->run_dir = NULL;
   pot->last_error[0] = '\0';
   return pot;
 }
@@ -155,18 +224,226 @@ int orcac_configure(OrcaCPot *pot, const OrcaCConfig *config) {
   free(pot->guess_atomic_numbers);
   pot->guess_atomic_numbers = NULL;
   pot->guess_n_atoms = 0;
+  if (pot->run_dir != NULL) {
+    orcac_remove_tree(pot->run_dir);
+    free(pot->run_dir);
+    pot->run_dir = NULL;
+  }
+  free(pot->resolved_exe);
+  pot->resolved_exe = dup_string(pot->config.orca_bin);
+  if (pot->resolved_exe == NULL) {
+    orcac_set_error(pot, "orcac: out of memory while storing executable path");
+    return -1;
+  }
   return 0;
 }
 
 OrcaCResult orcac_compute(OrcaCPot *pot, int n_atoms, const double *positions_ang,
                           const int *atomic_numbers, double *forces_h_bohr,
                           double *stress_h_bohr3x3) {
-  (void)stress_h_bohr3x3;
+  OrcaCResult ok;
+  char *input_text = NULL;
+  char *engrad_text = NULL;
+  char *stderr_tail = NULL;
+  char *stdout_tail = NULL;
+  char *inp = NULL;
+  char *out = NULL;
+  char *err = NULL;
+  char *engrad = NULL;
+  char *gbw = NULL;
+  char *guess = NULL;
+  OrcacChildResult child;
+  OrcacEngrad parsed;
+  int use_guess;
+
+  memset(&ok, 0, sizeof(ok));
+  memset(&parsed, 0, sizeof(parsed));
+
   if (pot == NULL || n_atoms <= 0 || positions_ang == NULL ||
       atomic_numbers == NULL || forces_h_bohr == NULL) {
     return orcac_fail_result(pot, "orcac: invalid compute arguments");
   }
-  return orcac_fail_result(pot, "orcac: compute path is not wired yet");
+  if (pot->run_dir == NULL) {
+    char run_dir[4096];
+    if (orcac_make_run_dir(pot->config.scratch_dir, run_dir, sizeof(run_dir),
+                           pot->last_error, sizeof(pot->last_error)) != 0) {
+      return orcac_fail_result(pot, pot->last_error);
+    }
+    pot->run_dir = dup_string(run_dir);
+    if (pot->run_dir == NULL) {
+      return orcac_fail_result(pot, "orcac: out of memory for scratch path");
+    }
+  }
+
+  inp = join_path2(pot->run_dir, "orcac.inp");
+  out = join_path2(pot->run_dir, "orcac.out");
+  err = join_path2(pot->run_dir, "orcac.err");
+  engrad = join_path2(pot->run_dir, "orcac.engrad");
+  gbw = join_path2(pot->run_dir, "orcac.gbw");
+  guess = join_path2(pot->run_dir, "orcac_guess.gbw");
+  if (inp == NULL || out == NULL || err == NULL || engrad == NULL || gbw == NULL ||
+      guess == NULL) {
+    orcac_set_error(pot, "orcac: out of memory for run file paths");
+    goto fail;
+  }
+
+  use_guess = 0;
+  if (pot->config.reuse_moread && pot->has_guess &&
+      pot->guess_n_atoms == (size_t)n_atoms && access(guess, R_OK) == 0) {
+    use_guess = 1;
+    for (int i = 0; i < n_atoms; ++i) {
+      if (pot->guess_atomic_numbers[i] != atomic_numbers[i]) {
+        use_guess = 0;
+        break;
+      }
+    }
+  }
+
+  if (safe_unlink(engrad) != 0 || safe_unlink(gbw) != 0) {
+    orcac_set_error(pot, "orcac: could not clear stale ORCA outputs");
+    goto fail;
+  }
+
+  if (orcac_render_input(&pot->config, n_atoms, positions_ang, atomic_numbers,
+                         use_guess ? "orcac_guess.gbw" : NULL,
+                         &input_text, pot->last_error,
+                         sizeof(pot->last_error)) != 0) {
+    goto fail;
+  }
+  if (write_text_file(inp, input_text, pot->last_error, sizeof(pot->last_error)) != 0) {
+    goto fail;
+  }
+
+  if (refresh_resolved_exe(pot) != 0) {
+    goto fail;
+  }
+
+  if (orcac_run_orca(pot->resolved_exe, pot->run_dir, "orcac.inp", out, err,
+                     pot->config.timeout_s, &child, pot->last_error,
+                     sizeof(pot->last_error)) != 0) {
+    goto fail;
+  }
+  if (child.timed_out) {
+    orcac_set_error(pot, "orcac: ORCA timed out after %d s", pot->config.timeout_s);
+    goto fail;
+  }
+  if (!child.exited || child.exit_code != 0) {
+    if (child.signal != 0) {
+      orcac_set_error(pot, "orcac: ORCA terminated by signal %d", child.signal);
+    } else {
+      orcac_set_error(pot, "orcac: ORCA exited with status %d", child.exit_code);
+    }
+    goto fail;
+  }
+
+  if (orcac_read_file(engrad, &engrad_text) != 0) {
+    orcac_set_error(pot, "orcac: ORCA finished without writing orcac.engrad");
+    goto fail;
+  }
+  if (orcac_parse_engrad(engrad_text, n_atoms, &parsed, pot->last_error,
+                         sizeof(pot->last_error)) != 0) {
+    goto fail;
+  }
+  for (int i = 0; i < n_atoms; ++i) {
+    if (parsed.atomic_numbers[i] != atomic_numbers[i]) {
+      orcac_set_error(pot,
+                      "orcac: engrad atomic numbers differ from the input");
+      goto fail;
+    }
+  }
+  if (!isfinite(parsed.energy_h)) {
+    orcac_set_error(pot, "orcac: engrad contains non-finite energy");
+    goto fail;
+  }
+  for (int i = 0; i < n_atoms * 3; ++i) {
+    if (!isfinite(parsed.gradient_h_bohr[i])) {
+      orcac_set_error(pot, "orcac: engrad contains non-finite gradients");
+      goto fail;
+    }
+    forces_h_bohr[i] = -parsed.gradient_h_bohr[i];
+  }
+
+  ok.ok = 1;
+  ok.energy_h = parsed.energy_h;
+  snprintf(ok.message, sizeof(ok.message), "ok");
+  if (stress_h_bohr3x3 != NULL) {
+    for (int i = 0; i < 9; ++i) {
+      stress_h_bohr3x3[i] = 0.0;
+    }
+  }
+
+  if (pot->config.reuse_moread && access(gbw, R_OK) == 0) {
+    FILE *in = fopen(gbw, "rb");
+    FILE *outf = fopen(guess, "wb");
+    if (in != NULL && outf != NULL) {
+      char buf[4096];
+      size_t got;
+      while ((got = fread(buf, 1u, sizeof(buf), in)) > 0) {
+        fwrite(buf, 1u, got, outf);
+      }
+      fclose(in);
+      fclose(outf);
+      free(pot->guess_atomic_numbers);
+      pot->guess_atomic_numbers = (int *)malloc((size_t)n_atoms * sizeof(int));
+      if (pot->guess_atomic_numbers != NULL) {
+        memcpy(pot->guess_atomic_numbers, atomic_numbers,
+               (size_t)n_atoms * sizeof(int));
+        pot->guess_n_atoms = (size_t)n_atoms;
+        pot->has_guess = 1;
+      } else {
+        pot->has_guess = 0;
+      }
+    } else {
+      if (in != NULL) {
+        fclose(in);
+      }
+      if (outf != NULL) {
+        fclose(outf);
+      }
+      pot->has_guess = 0;
+    }
+  }
+
+  goto done;
+
+fail:
+  pot->has_guess = 0;
+  free(pot->guess_atomic_numbers);
+  pot->guess_atomic_numbers = NULL;
+  pot->guess_n_atoms = 0;
+
+  stderr_tail = err ? orcac_file_tail(err, ORCAC_TAIL_BYTES) : NULL;
+  stdout_tail = out ? orcac_file_tail(out, ORCAC_TAIL_BYTES) : NULL;
+  if (stderr_tail != NULL || stdout_tail != NULL) {
+    const char *fmt = "%s\nstderr tail:\n%s\nstdout tail:\n%s";
+    const char *se = stderr_tail ? stderr_tail : "(none)";
+    const char *so = stdout_tail ? stdout_tail : "(none)";
+    int need = snprintf(NULL, 0, fmt, pot->last_error, se, so);
+    char *full = need >= 0 ? (char *)malloc((size_t)need + 1u) : NULL;
+    if (full != NULL) {
+      snprintf(full, (size_t)need + 1u, fmt, pot->last_error, se, so);
+      ok = orcac_fail_result(pot, full);
+      free(full);
+    } else {
+      ok = orcac_fail_result(pot, pot->last_error);
+    }
+  } else {
+    ok = orcac_fail_result(pot, pot->last_error);
+  }
+
+done:
+  free(stderr_tail);
+  free(stdout_tail);
+  free(input_text);
+  free(engrad_text);
+  free(inp);
+  free(out);
+  free(err);
+  free(engrad);
+  free(gbw);
+  free(guess);
+  orcac_free_engrad(&parsed);
+  return ok;
 }
 
 const char *orcac_last_error(const OrcaCPot *pot) {
@@ -177,12 +454,23 @@ void orcac_destroy(OrcaCPot *pot) {
   if (pot == NULL) {
     return;
   }
+  if (pot->run_dir != NULL) {
+    orcac_remove_tree(pot->run_dir);
+  }
   orcac_free_config(&pot->config);
   free(pot->guess_atomic_numbers);
+  free(pot->run_dir);
+  free(pot->resolved_exe);
   free(pot);
 }
 
 const char *orcac_version(void) { return ORCAC_VERSION_STRING; }
 int orcac_c_abi_version(void) { return RGPOT_ORCAC_C_ABI_VERSION; }
 int orcac_abi_version(void) { return ORCAC_ABI_VERSION; }
-int orcac_available(void) { return 0; }
+int orcac_available(void) {
+  char buf[4096];
+  return orcac_resolve_executable(orcac_default_orca_bin(), buf, sizeof(buf),
+                                  NULL, 0) == 0
+             ? 1
+             : 0;
+}

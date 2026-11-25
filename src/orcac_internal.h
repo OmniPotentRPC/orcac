@@ -8,6 +8,8 @@
 
 struct OrcaCPot {
   OrcaCConfig config;
+  char *run_dir;
+  char *resolved_exe;
   char last_error[ORCAC_LAST_ERROR_SIZE];
   int has_guess;
   int *guess_atomic_numbers;

@@ -22,7 +22,12 @@ endif
 
 liborcac = library(
   'orcac',
-  ['src/orcac.c'],
+  [
+    'src/orcac.c',
+    'src/orca_input.c',
+    'src/orca_parse.c',
+    'src/orca_runner.c',
+  ],
   include_directories: [inc],
   dependencies: [math_dep],
   c_args: common_c_args + ['-DORCAC_BUILD'],
