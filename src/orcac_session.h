@@ -124,6 +124,11 @@ int orcac_session_keep_run(OrcacSessionDirs *dirs);
  */
 extern void (*orcac_test_after_keep)(int root_fd);
 /*
+ * Called by a successful orcac_session_keep_run with root_fd once the
+ * run has moved, right before the mkdirat of the new run/.
+ */
+extern void (*orcac_test_before_new_run)(int root_fd);
+/*
  * Called by orcac_session_keep_run after its last check of run/ and
  * keep/, right before the renameat.
  */

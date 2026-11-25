@@ -2371,7 +2371,10 @@ static void swap_root_for_decoy(OrcaCSession *s) {
 
 static int keep_hook_calls = 0;
 
-/* run/ has just moved to keep/failed; make recreating it fail. */
+/*
+ * run/ has just moved to keep/failed and the new one is not made yet;
+ * make that mkdirat fail.
+ */
 static void lock_root_after_keep(int root_fd) {
   ++keep_hook_calls;
   CHECK(fchmod(root_fd, 0500) == 0, "lock the session root");
@@ -2471,15 +2474,18 @@ static void test_pinned_run_files(const char *fake_bin, const char *scratch) {
   }
   setenv("ORCAC_FAKE_FAIL", "3", 1);
   keep_hook_calls = 0;
-  orcac_test_after_keep = lock_root_after_keep;
+  orcac_test_before_new_run = lock_root_after_keep;
   st = orcac_energy_gradient(s, 3, kPos, kZ, ORCAC_WANT_ENERGY, &e, NULL,
                              NULL);
-  orcac_test_after_keep = NULL;
+  orcac_test_before_new_run = NULL;
   unsetenv("ORCAC_FAKE_FAIL");
   CHECK(keep_hook_calls == 1, "keep hook not called");
   CHECK(st == ORCAC_E_ERROR &&
             strstr(orcac_last_error(s), "run files kept in") != NULL,
         "kept run not named when run/ could not be recreated");
+  CHECK(s->dirs.run_fd == -1 && access(s->dirs.run, F_OK) != 0 &&
+            entry_count(s->dirs.keep_failed) > 0,
+        "run/ recreated, or the run not kept, with the root locked");
   st = orcac_energy_gradient(s, 3, kPos, kZ, ORCAC_WANT_ENERGY, &e, NULL,
                              NULL);
   CHECK(st == ORCAC_E_ERROR &&

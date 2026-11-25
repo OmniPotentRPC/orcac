@@ -12,6 +12,7 @@
 
 #ifdef ORCAC_TEST_HOOKS
 void (*orcac_test_after_keep)(int root_fd) = NULL;
+void (*orcac_test_before_new_run)(int root_fd) = NULL;
 void (*orcac_test_before_keep)(int root_fd, int keep_fd) = NULL;
 void (*orcac_test_after_move)(int root_fd, int keep_fd) = NULL;
 int (*orcac_test_before_restore)(int root_fd, int keep_fd) = NULL;
@@ -430,6 +431,11 @@ int orcac_session_keep_run(OrcacSessionDirs *dirs) {
   int saved = errno;
   if (!entry_is_fd(dirs->root_fd, "run", dirs->run_fd)) {
     close_fd(&dirs->run_fd);
+#ifdef ORCAC_TEST_HOOKS
+    if (kept == 0 && orcac_test_before_new_run != NULL) {
+      orcac_test_before_new_run(dirs->root_fd);
+    }
+#endif
     if (mkdirat(dirs->root_fd, "run", 0700) == 0) {
 #ifdef ORCAC_TEST_HOOKS
       if (kept == 0 && orcac_test_after_keep != NULL) {
