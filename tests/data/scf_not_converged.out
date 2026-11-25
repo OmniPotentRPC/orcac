@@ -1,0 +1,16 @@
+                                 *****************
+                                 * O   R   C   A *
+                                 *****************
+
+--------------
+SCF ITERATIONS
+--------------
+ITER       Energy         Delta-E        Max-DP      RMS-DP      [F,P]     Damp
+  0    -75.9000000000   0.000000e+00  1.00e-01  1.00e-02  1.00e-01  0.700
+...
+               *****************************************************
+               *                      ERROR                        *
+               *           SCF NOT CONVERGED AFTER 125 CYCLES      *
+               *****************************************************
+
+ORCA finished by error termination in SCF

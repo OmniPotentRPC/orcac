@@ -1,0 +1,3 @@
+option('with_tests', type: 'boolean', value: true, description: 'Build tests')
+option('schema_sync', type: 'feature', value: 'auto',
+       description: 'Fetch the pinned rgconf archive and check the vendored schema against it')

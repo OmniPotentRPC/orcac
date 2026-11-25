@@ -1,0 +1,8 @@
+/* Only the orcac_ C ABI leaves liborcac; the vendored Cap'n Proto runtime
+ * and generated schema code stay internal. */
+{
+  global:
+    orcac_*;
+  local:
+    *;
+};
