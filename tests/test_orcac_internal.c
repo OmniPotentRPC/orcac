@@ -1712,6 +1712,82 @@ static void test_keep_restore_eio(const char *scratch, int decoy,
   CHECK(entry_count(scratch) == before, "scratch not back to its entries");
 }
 
+static char made_run_to[PATH_MAX + 32];
+static int new_run_kind = 0;
+static int new_run_calls = 0;
+
+/*
+ * Between the mkdirat of the new run/ and its openat, move it out and
+ * put in its place a directory holding a file named impostor (kind 0),
+ * an empty directory open to others (kind 1) or a symlink to the moved
+ * run/ (kind 2).
+ */
+static void swap_new_run(int root_fd) {
+  int ok;
+  ++new_run_calls;
+  ok = renameat(root_fd, "run", AT_FDCWD, made_run_to) == 0;
+  if (new_run_kind == 2) {
+    ok = ok && symlinkat(made_run_to, root_fd, "run") == 0;
+  } else {
+    ok = ok && mkdirat(root_fd, "run", 0700) == 0 &&
+         fchmodat(root_fd, "run", new_run_kind == 1 ? 0755 : 0700, 0) == 0;
+  }
+  if (ok && new_run_kind == 0) {
+    int fd = openat(root_fd, "run/impostor",
+                    O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    ok = fd >= 0;
+    if (fd >= 0) {
+      close(fd);
+    }
+  }
+  CHECK(ok, "swap the new run/ before it is opened");
+}
+
+/*
+ * The new run/ keep_run makes swapped before it is opened: run_fd is
+ * not opened on the stand-in, which is left alone, and the run stays
+ * kept; the next reset makes a run/ again.
+ */
+static void test_keep_new_run_swapped(const char *scratch, int kind) {
+  OrcacSessionDirs dirs;
+  char err[256];
+  char path[PATH_MAX + 64];
+  struct stat st;
+  int before = entry_count(scratch);
+  int rc;
+
+  CHECK(orcac_session_open(scratch, &dirs, err, sizeof(err)) == 0,
+        "open for a swapped new run/");
+  if (dirs.root == NULL) {
+    return;
+  }
+  snprintf(made_run_to, sizeof(made_run_to), "%s/run-made", scratch);
+  snprintf(path, sizeof(path), "%s/marker", dirs.run);
+  write_file(path, "marker");
+  new_run_kind = kind;
+  new_run_calls = 0;
+  orcac_test_after_keep = swap_new_run;
+  rc = orcac_session_keep_run(&dirs);
+  orcac_test_after_keep = NULL;
+  CHECK(new_run_calls == 1, "new run/ hook not called");
+  CHECK(rc == 0 && file_is(dirs.keep_failed, "marker", "marker"),
+        "run not kept when the new run/ was swapped");
+  CHECK(dirs.run_fd < 0, "run_fd opened on a swapped-in run/");
+  CHECK(fstatat(dirs.root_fd, "run", &st, AT_SYMLINK_NOFOLLOW) == 0 &&
+            (kind == 2 ? S_ISLNK(st.st_mode) : S_ISDIR(st.st_mode)),
+        "swapped-in run/ not left in place");
+  if (kind == 0) {
+    CHECK(file_is(dirs.run, "impostor", ""), "swapped-in run/ touched");
+  }
+  CHECK(orcac_session_reset_run(&dirs, err, sizeof(err)) == 0 &&
+            dirs.run_fd >= 0 && entry_count(dirs.run) == 0,
+        "reset after a swapped new run/");
+  CHECK(orcac_session_close(&dirs, err, sizeof(err)) == 0,
+        "close after a swapped new run/");
+  CHECK(rmdir(made_run_to) == 0, "remove the moved new run/");
+  CHECK(entry_count(scratch) == before, "scratch not back to its entries");
+}
+
 /*
  * With allocation failing for good from the kth path allocation of
  * orcac_session_open on, the new root is still removed: undoing it
@@ -2243,6 +2319,9 @@ int main(int argc, char **argv) {
   test_keep_restore_eio(scratch, 0, 1);
   test_keep_restore_eio(scratch, 1, 0);
   test_keep_restore_eio(scratch, 1, 1);
+  test_keep_new_run_swapped(scratch, 0);
+  test_keep_new_run_swapped(scratch, 1);
+  test_keep_new_run_swapped(scratch, 2);
   test_session_alloc_stuck(scratch);
   test_configure_cleanup_fails(fake_bin, scratch);
   test_configure_rollback_fails(fake_bin, scratch);

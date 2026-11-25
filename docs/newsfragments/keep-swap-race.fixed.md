@@ -14,3 +14,14 @@ leaves another object as `run/`; a move back that fails reports its own
 error, `EIO` in place of `EXDEV`. The pinned object then stays where it
 was left, and the session's `run/` descriptor is never reopened by name
 on an entry it did not make or verify.
+
+A `run/`, `guess/` or `keep/` the session makes, including the `run/`
+made again after a keep or a reset, could be swapped between its
+`mkdirat` and the `openat` that pins it, so the session could hold an
+impostor as `run/`. No POSIX call makes a directory and returns a
+descriptor on it, so the opened directory is now kept only while it is
+still the root's entry, on the root's device, owned by the caller,
+without group or other access, and empty. Anything else is closed, left
+in place and fails with `EIO`. An empty private directory of the same
+user swapped in still passes those checks and cannot be told apart from
+the one made.

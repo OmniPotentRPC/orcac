@@ -2,6 +2,7 @@
 #include "orca_runner.h"
 #include "orcac_errbuf.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -65,6 +66,106 @@ static void close_fd(int *fd) {
     close(*fd);
   }
   *fd = -1;
+}
+
+static int same_object(const struct stat *a, const struct stat *b) {
+  return (a->st_mode & S_IFMT) == (b->st_mode & S_IFMT) &&
+         a->st_dev == b->st_dev && a->st_ino == b->st_ino;
+}
+
+/* 1 while name in dirfd is the object pin was taken of. errno is kept. */
+static int entry_is_pin(int dirfd, const char *name, const struct stat *pin) {
+  int saved = errno;
+  struct stat entry;
+  int ok = fstatat(dirfd, name, &entry, AT_SYMLINK_NOFOLLOW) == 0 &&
+           same_object(&entry, pin);
+  errno = saved;
+  return ok;
+}
+
+/* 1 while name in dirfd is the directory open at fd. errno is kept. */
+static int entry_is_fd(int dirfd, const char *name, int fd) {
+  int saved = errno;
+  struct stat st;
+  int ok = fd >= 0 && fstat(fd, &st) == 0 && S_ISDIR(st.st_mode) &&
+           entry_is_pin(dirfd, name, &st);
+  errno = saved;
+  return ok;
+}
+
+/* 1 when the directory open at fd holds nothing, 0 when it does, else -1. */
+static int dir_is_empty(int fd) {
+  int dup_fd = openat(fd, ".", DIR_FLAGS);
+  DIR *dir;
+  struct dirent *ent;
+  int empty = 1;
+  if (dup_fd < 0) {
+    return -1;
+  }
+  dir = fdopendir(dup_fd);
+  if (dir == NULL) {
+    int saved = errno;
+    close(dup_fd);
+    errno = saved;
+    return -1;
+  }
+  errno = 0;
+  while ((ent = readdir(dir)) != NULL) {
+    if (strcmp(ent->d_name, ".") != 0 && strcmp(ent->d_name, "..") != 0) {
+      empty = 0;
+      break;
+    }
+  }
+  if (ent == NULL && errno != 0) {
+    int saved = errno;
+    closedir(dir);
+    errno = saved;
+    return -1;
+  }
+  closedir(dir);
+  return empty;
+}
+
+/*
+ * Open name in dirfd right after this process made it with mkdirat. No
+ * POSIX call makes a directory and returns a descriptor on it, so the
+ * entry can be swapped in between. What opens is kept only while it is
+ * still dirfd's entry, a directory on dirfd's device, owned by this
+ * user, without group or other access, and empty; otherwise it is
+ * closed, left where it is, and the result is -1 with EIO, or with the
+ * error that kept it from being read. An empty private directory of
+ * this user swapped in passes those checks, and nothing can tell it
+ * from the one made.
+ */
+static int open_new_dir(int dirfd, const char *name) {
+  struct stat parent;
+  struct stat st;
+  int empty;
+  int fd = openat(dirfd, name, DIR_FLAGS);
+  if (fd < 0) {
+    return -1;
+  }
+  if (fstat(dirfd, &parent) != 0 || fstat(fd, &st) != 0) {
+    int saved = errno;
+    close(fd);
+    errno = saved;
+    return -1;
+  }
+  if (!S_ISDIR(st.st_mode) || st.st_dev != parent.st_dev ||
+      st.st_uid != geteuid() || (st.st_mode & 077) != 0 ||
+      !entry_is_pin(dirfd, name, &st)) {
+    close(fd);
+    errno = EIO;
+    return -1;
+  }
+  empty = dir_is_empty(fd);
+  if (empty != 1) {
+    int saved = empty < 0 ? errno : EIO;
+    close(fd);
+    errno = saved;
+    return -1;
+  }
+  return fd;
 }
 
 static void init_dirs(OrcacSessionDirs *dirs) {
@@ -237,9 +338,9 @@ int orcac_session_open(const char *scratch_root, OrcacSessionDirs *dirs,
   if (mkdirat(dirs->root_fd, "run", 0700) != 0 ||
       mkdirat(dirs->root_fd, "guess", 0700) != 0 ||
       mkdirat(dirs->root_fd, "keep", 0700) != 0 ||
-      (dirs->run_fd = openat(dirs->root_fd, "run", DIR_FLAGS)) < 0 ||
-      (dirs->guess_fd = openat(dirs->root_fd, "guess", DIR_FLAGS)) < 0 ||
-      (dirs->keep_fd = openat(dirs->root_fd, "keep", DIR_FLAGS)) < 0) {
+      (dirs->run_fd = open_new_dir(dirs->root_fd, "run")) < 0 ||
+      (dirs->guess_fd = open_new_dir(dirs->root_fd, "guess")) < 0 ||
+      (dirs->keep_fd = open_new_dir(dirs->root_fd, "keep")) < 0) {
     orcac_errf(errbuf, errbuf_n,
                "orcac: could not create the scratch layout in %s: %s", root,
                strerror(errno));
@@ -254,37 +355,12 @@ int orcac_session_reset_run(OrcacSessionDirs *dirs, char *errbuf,
   close_fd(&dirs->run_fd);
   if (orcac_remove_tree_at(dirs->root_fd, "run") != 0 ||
       mkdirat(dirs->root_fd, "run", 0700) != 0 ||
-      (dirs->run_fd = openat(dirs->root_fd, "run", DIR_FLAGS)) < 0) {
+      (dirs->run_fd = open_new_dir(dirs->root_fd, "run")) < 0) {
     orcac_errf(errbuf, errbuf_n, "orcac: could not empty %s: %s", dirs->run,
                strerror(errno));
     return -1;
   }
   return 0;
-}
-
-static int same_object(const struct stat *a, const struct stat *b) {
-  return (a->st_mode & S_IFMT) == (b->st_mode & S_IFMT) &&
-         a->st_dev == b->st_dev && a->st_ino == b->st_ino;
-}
-
-/* 1 while name in dirfd is the object pin was taken of. errno is kept. */
-static int entry_is_pin(int dirfd, const char *name, const struct stat *pin) {
-  int saved = errno;
-  struct stat entry;
-  int ok = fstatat(dirfd, name, &entry, AT_SYMLINK_NOFOLLOW) == 0 &&
-           same_object(&entry, pin);
-  errno = saved;
-  return ok;
-}
-
-/* 1 while name in dirfd is the directory open at fd. errno is kept. */
-static int entry_is_fd(int dirfd, const char *name, int fd) {
-  int saved = errno;
-  struct stat st;
-  int ok = fd >= 0 && fstat(fd, &st) == 0 && S_ISDIR(st.st_mode) &&
-           entry_is_pin(dirfd, name, &st);
-  errno = saved;
-  return ok;
 }
 
 static int keep_pinned(const OrcacSessionDirs *dirs) {
@@ -383,21 +459,21 @@ static int move_run_to_keep(OrcacSessionDirs *dirs) {
 
 /*
  * run_fd is kept only while it is still the root's run entry; otherwise
- * it is replaced only by a run/ this call made itself, never by
- * whatever else holds that name.
+ * it is replaced only by a run/ this call made and open_new_dir
+ * accepts, never by whatever else holds that name.
  */
 int orcac_session_keep_run(OrcacSessionDirs *dirs) {
   int kept = move_run_to_keep(dirs);
   int saved = errno;
   if (!entry_is_fd(dirs->root_fd, "run", dirs->run_fd)) {
     close_fd(&dirs->run_fd);
-#ifdef ORCAC_TEST_HOOKS
-    if (kept == 0 && orcac_test_after_keep != NULL) {
-      orcac_test_after_keep(dirs->root_fd);
-    }
-#endif
     if (mkdirat(dirs->root_fd, "run", 0700) == 0) {
-      dirs->run_fd = openat(dirs->root_fd, "run", DIR_FLAGS);
+#ifdef ORCAC_TEST_HOOKS
+      if (kept == 0 && orcac_test_after_keep != NULL) {
+        orcac_test_after_keep(dirs->root_fd);
+      }
+#endif
+      dirs->run_fd = open_new_dir(dirs->root_fd, "run");
     }
   }
   errno = saved;

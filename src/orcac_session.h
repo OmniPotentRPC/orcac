@@ -16,6 +16,16 @@
  * created, read, renamed and removed relative to them, so replacing any
  * path component cannot redirect them. The path strings are for
  * messages only.
+ *
+ * POSIX has no call that makes a directory and returns a descriptor on
+ * it, so each of run/, guess/ and keep/, whenever it is made, is opened
+ * by name after its mkdirat and kept only while it is still the root's
+ * entry, a directory on the root's device, owned by this user, without
+ * group or other access, and empty. Anything else swapped in between is
+ * closed and left in place, and the call fails with EIO, or with the
+ * error that kept the directory from being read. An empty private
+ * directory of this user swapped in passes those checks, and nothing
+ * can tell it from the one made.
  */
 typedef struct OrcacSessionDirs {
   char *root;
@@ -57,7 +67,10 @@ int orcac_session_remove(OrcacSessionDirs *dirs, char *errbuf,
 /* Free the paths and close the descriptors, leaving the files. */
 void orcac_session_free(OrcacSessionDirs *dirs);
 
-/* Remove everything inside run/, recreate it empty and reopen run_fd. */
+/*
+ * Remove everything inside run/, recreate it empty and reopen run_fd,
+ * checked as above; on -1 run_fd is -1.
+ */
 int orcac_session_reset_run(OrcacSessionDirs *dirs, char *errbuf,
                             size_t errbuf_n);
 
@@ -86,13 +99,17 @@ int orcac_session_reset_run(OrcacSessionDirs *dirs, char *errbuf,
  * (EIO for EXDEV). In those cases the pinned object is wherever it was
  * left: in keep/failed, in a keep/ that left the root, or taken away.
  * run_fd stays open only while it is still the root's run entry;
- * otherwise it is closed and replaced only by a run/ this call made,
- * else -1, so it is never opened on an entry put there by anyone else.
+ * otherwise it is closed and replaced only by a run/ this call made
+ * and that passes the checks above, else -1, so it is never opened on
+ * a non-empty, shared or foreign entry put there by anyone else.
  */
 int orcac_session_keep_run(OrcacSessionDirs *dirs);
 
 #ifdef ORCAC_TEST_HOOKS
-/* Called with root_fd once run/ has been moved to keep/failed. */
+/*
+ * Called by a successful orcac_session_keep_run with root_fd once it
+ * has made the new run/, between that mkdirat and the openat.
+ */
 extern void (*orcac_test_after_keep)(int root_fd);
 /*
  * Called by orcac_session_keep_run after its last check of run/ and

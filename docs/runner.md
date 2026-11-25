@@ -97,36 +97,50 @@ Nothing in the session is reached by path. The scratch directory is
 opened first and stays pinned; `mkdirat` makes the root relative to
 it, trying fresh random names while the name is taken, and the root is
 then opened through the pinned parent with `O_DIRECTORY | O_NOFOLLOW` and
-must be that entry, owned by the caller and mode 0700. `run/`,
-`guess/` and `keep/` are pinned the same way, and `run/` again each
-time it is recreated. A failed run moves to `keep/failed` with one
-`renameat` between the pinned root and the pinned `keep/`, made only
-while the root's `run` and `keep` entries are still those descriptors
-by device and inode; a `keep/` renamed away or replaced by a symlink or
-another directory gets nothing, the call fails with `EXDEV` and the
-files stay in `run/`. `renameat` cannot name an inode, so whatever the
-rename put in `keep/failed` is pinned by type, device and inode as soon
-as it returns. The run counts as kept only when that pin is the pinned
-`run/`, `keep/failed` is still the pin and the root's `keep` entry is
-still the pinned `keep/`. Otherwise, when `run/` was swapped for a
-decoy in the window between the last check and the rename, or `keep/`
-left the root, the pinned object is renamed back to the root's `run`
-entry through the held `keep/` descriptor, wherever `keep/` went, and
-the call fails with `EXDEV` only once the root's `run` entry is the pin
-again. `EXDEV` therefore means that what the rename took is back as
-`run/`: the run's own files when `keep/` left the root, the decoy when
-`run/` was swapped. In the decoy case the run's files were moved away
-before the rename by whoever swapped `run/`, and the call does not
-bring them back. When `keep/failed` is no longer the pin, nothing is
-renamed back and the call fails with `EIO`. When the rename back fails
-the call fails with its error, `EIO` in place of `EXDEV`, and when it
-succeeds but the root's `run` entry is not the pin afterwards it fails
-with `EIO`. In those cases the pinned object is wherever it was left:
-in `keep/failed`, in a `keep/` that left the root, or wherever it was
-taken. After every call the session's `run/` descriptor is kept only
-while it is still the root's `run` entry; otherwise it is replaced only
-by a `run/` the call made itself, or left closed for the next call to
-make again, and never opened on an entry someone else put there. The deck and ORCA's stdout and stderr are created with
+must be that entry, owned by the caller and mode 0700. POSIX has no call
+that makes a directory and returns a descriptor on it, so `run/`,
+`guess/` and `keep/`, and `run/` again each time it is recreated, are
+opened by name after their `mkdirat` with `O_DIRECTORY | O_NOFOLLOW` and
+kept only while the opened directory is still the root's entry, on the
+root's device, owned by the caller, without group or other access, and
+empty. Anything else swapped in between the two calls is closed and left
+in place, and the call fails with `EIO`, or with the error that kept the
+directory from being read (`orcac_session_keep_run` still reports the
+run as kept, with no `run/` open until the next reset makes one). An
+empty private directory of the same user swapped in passes those checks;
+nothing can tell it from the one made.
+
+A failed run moves to `keep/failed` with one `renameat` between the
+pinned root and the pinned `keep/`, made only while the root's `run` and
+`keep` entries are still those descriptors by device and inode; a
+`keep/` renamed away or replaced by a symlink or another directory gets
+nothing, the call fails with `EXDEV` and the files stay in `run/`.
+`renameat` cannot name an inode, so whatever the rename put in
+`keep/failed` is pinned by type, device and inode as soon as it returns.
+The run counts as kept only when that pin is the pinned `run/`,
+`keep/failed` is still the pin and the root's `keep` entry is still the
+pinned `keep/`. Otherwise, when `run/` was swapped for a decoy in the
+window between the last check and the rename, or `keep/` left the root,
+the pinned object is renamed back to the root's `run` entry through the
+held `keep/` descriptor, wherever `keep/` went, and the call fails with
+`EXDEV` only once the root's `run` entry is the pin again. `EXDEV`
+therefore means that what the rename took is back as `run/`: the run's
+own files when `keep/` left the root, the decoy when `run/` was swapped.
+In the decoy case the run's files were moved away before the rename by
+whoever swapped `run/`, and the call does not bring them back. When
+`keep/failed` is no longer the pin, nothing is renamed back and the call
+fails with `EIO`. When the rename back fails the call fails with its
+error, `EIO` in place of `EXDEV`, and when it succeeds but the root's
+`run` entry is not the pin afterwards it fails with `EIO`. In those
+cases the pinned object is wherever it was left: in `keep/failed`, in a
+`keep/` that left the root, or wherever it was taken. After every call
+the session's `run/` descriptor is kept only while it is still the
+root's `run` entry; otherwise it is replaced only by a `run/` the call
+made itself and that passes the checks above, or left closed for the
+next call to make again, and never opened on a non-empty, shared or
+foreign entry someone else put there.
+
+The deck and ORCA's stdout and stderr are created with
 `openat(..., O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC)` in the pinned
 `run/`, ORCA starts there through `fchdir`, and its outputs, the `.gbw`
 stored as a guess included, are read with `O_NOFOLLOW` and must be
