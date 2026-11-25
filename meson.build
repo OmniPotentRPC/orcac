@@ -21,15 +21,17 @@ if cc.get_id() != 'msvc'
   common_c_args += ['-Wall', '-Wextra', '-Wpedantic']
 endif
 
+liborcac_sources = files(
+  'src/orcac.c',
+  'src/orcac_cache.c',
+  'src/orca_input.c',
+  'src/orca_parse.c',
+  'src/orca_runner.c',
+)
+
 liborcac = library(
   'orcac',
-  [
-    'src/orcac.c',
-    'src/orcac_cache.c',
-    'src/orca_input.c',
-    'src/orca_parse.c',
-    'src/orca_runner.c',
-  ],
+  liborcac_sources,
   include_directories: [inc],
   dependencies: [math_dep, threads_dep],
   c_args: common_c_args + ['-DORCAC_BUILD'],
@@ -69,6 +71,29 @@ if get_option('with_tests')
   )
   test('replay_orca_output', test_replay,
        args: [meson.current_source_dir()])
+
+  test_abi = executable(
+    'test_orcac_abi',
+    'tests/test_orcac_abi.c',
+    include_directories: inc,
+    link_with: liborcac,
+    dependencies: [math_dep, threads_dep],
+    c_args: common_c_args,
+  )
+  test('abi_behaviour', test_abi,
+       args: [meson.current_source_dir()],
+       timeout: 120)
+
+  test_internal = executable(
+    'test_orcac_internal',
+    ['tests/test_orcac_internal.c', liborcac_sources],
+    include_directories: [inc, include_directories('src')],
+    dependencies: [math_dep, threads_dep],
+    c_args: common_c_args + ['-DORCAC_TEST_HOOKS'],
+  )
+  test('internal', test_internal,
+       args: [meson.current_source_dir()],
+       timeout: 60)
 
   test_real_optional = executable(
     'test_orca_real_optional',

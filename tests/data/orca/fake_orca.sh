@@ -2,6 +2,22 @@
 # Hand-written stand-in for the ORCA binary. Not an ORCA build and not
 # the output of an ORCA run. The tests point executable here.
 # ORCAC_FAKE_REPLAY is the directory holding the synthetic fixtures.
+#
+# Modes, all optional:
+#   ORCAC_FAKE_LOG           append the cwd and the input deck to this file
+#   ORCAC_FAKE_STARTED       create this file once the run has started
+#   ORCAC_FAKE_ENV_LOG       write the child environment to this file
+#   ORCAC_FAKE_SLEEP         sleep this many seconds first
+#   ORCAC_FAKE_STRAY_PIDFILE leave a background child, write its pid here
+#   ORCAC_FAKE_FAIL          print an error and exit with this status
+#   ORCAC_FAKE_NOCONV        print the unconverged-SCF fixture and exit
+#                            with this status; 0 also writes the outputs
+#   ORCAC_FAKE_FAIL_MOREAD   like ORCAC_FAKE_NOCONV=1, only for decks
+#                            that request MORead
+#   ORCAC_FAKE_FD_LOG        list this shell's open descriptors here
+#   ORCAC_FAKE_ENGRAD        fixture copied as the .engrad instead of
+#                            replay.engrad
+#   ORCAC_FAKE_STDOUT        fixture printed instead of replay.stdout
 set -u
 
 log=${ORCAC_FAKE_LOG:-}
@@ -20,6 +36,15 @@ if [ -n "$log" ]; then
   printf '=== %s ===\n' "$inp" >> "$log"
   printf 'CWD %s\n' "$(pwd)" >> "$log"
   /bin/cat "$inp" >> "$log"
+fi
+if [ -n "${ORCAC_FAKE_STARTED:-}" ]; then
+  : > "${ORCAC_FAKE_STARTED}"
+fi
+if [ -n "${ORCAC_FAKE_ENV_LOG:-}" ]; then
+  /usr/bin/env > "${ORCAC_FAKE_ENV_LOG}"
+fi
+if [ -n "${ORCAC_FAKE_FD_LOG:-}" ]; then
+  /bin/ls -l "/proc/$$/fd" > "${ORCAC_FAKE_FD_LOG}" 2>&1
 fi
 
 if [ -n "${ORCAC_FAKE_SLEEP:-}" ]; then
@@ -40,7 +65,19 @@ if [ -z "$replay" ]; then
   echo "fake orca: ORCAC_FAKE_REPLAY is unset" >&2
   exit 2
 fi
-/bin/cp "$replay/replay.engrad" "${base}.engrad"
-/bin/cat "$replay/replay.stdout"
+noconv=${ORCAC_FAKE_NOCONV:-}
+if [ -n "${ORCAC_FAKE_FAIL_MOREAD:-}" ] && /bin/grep -q 'MORead' "$inp"; then
+  noconv=1
+fi
+if [ -n "$noconv" ]; then
+  /bin/cat "$replay/scf_not_converged.stdout"
+  if [ "$noconv" = 0 ]; then
+    /bin/cp "$replay/replay.engrad" "${base}.engrad"
+    printf 'gbw' > "${base}.gbw"
+  fi
+  exit "$noconv"
+fi
+/bin/cp "$replay/${ORCAC_FAKE_ENGRAD:-replay.engrad}" "${base}.engrad"
+/bin/cat "$replay/${ORCAC_FAKE_STDOUT:-replay.stdout}"
 printf 'gbw' > "${base}.gbw"
 exit 0
