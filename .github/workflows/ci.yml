@@ -23,10 +23,10 @@ jobs:
         run: python3 scripts/build_docs.py
 
   orca-optional:
-    if: ${{ vars.ORCA_BIN != '' }}
+    if: ${{ vars.ORCAC_ORCA != '' }}
     runs-on: ubuntu-latest
     env:
-      ORCA_BIN: ${{ vars.ORCA_BIN }}
+      ORCAC_ORCA: ${{ vars.ORCAC_ORCA }}
     steps:
       - uses: actions/checkout@v4
       - name: Install build tools

@@ -7,18 +7,20 @@ loads `mopacc` and `nwchemc`, and other hosts can use it without rgpot.
 
 The pieces map as follows:
 
-- Input writing: one `! method basis keywords EnGrad` line, optional
-  `%maxcore`, `%pal nprocs` and `%moinp` with `MORead`, then an `xyz` block
-  in Angstrom.
+- Input writing: one `! method basis keywords EnGrad` line, validated user
+  blocks, optional `%maxcore`, `%pal nprocs` and `%moinp` with `MORead`, an
+  always-present `%scf ConvForced true end`, then an `xyz` block in
+  Angstrom.
 - Execution: a per-instance scratch directory, the ORCA process in its own
   process group, stdout and stderr captured to files, and a wall-clock
   timeout that escalates from SIGTERM to SIGKILL.
 - Parsing: the `.engrad` atom count, energy in Eh, gradient in Eh/bohr and
   atomic numbers, checked against the input.
 
-An rgpot frontend fills `OrcaCConfig` from its potential options. Forces are
-the negated gradient in Hartree/Bohr, the units rgpot's other split engines
-return. The orcac test fixtures are synthetic and contain no ORCA output.
+An rgpot frontend fills `OrcaCConfig` from its potential options after
+`orcac_config_init`. orcac returns the gradient in Hartree/Bohr, the units
+rgpot's other split engines use; the frontend negates it for forces. The
+orcac test fixtures are synthetic and contain no ORCA output.
 
 The input and `.engrad` formats follow the ORCA 6.1 manual sections on input
 structure and the initial guess.

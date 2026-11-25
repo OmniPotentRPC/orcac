@@ -40,26 +40,36 @@ int main(void) {
   }
 
   OrcaCConfig cfg;
-  memset(&cfg, 0, sizeof(cfg));
-  cfg.method = "HF";
-  cfg.basis = "STO-3G";
-  OrcaCPot *pot = orcac_create(&cfg);
-  if (pot == NULL) {
-    fprintf(stderr, "orcac_create failed\n");
+  if (orcac_config_init(&cfg, sizeof(cfg)) != ORCAC_OK) {
+    fprintf(stderr, "orcac_config_init failed\n");
     return 2;
   }
-  OrcaCResult r = orcac_compute(pot, 0, NULL, NULL, NULL, NULL);
-  if (r.ok || r.message[0] == '\0' || orcac_last_error(pot)[0] == '\0') {
-    fprintf(stderr, "invalid compute must fail with a message\n");
-    orcac_destroy(pot);
+  cfg.executable = "/bin/sh";
+  OrcaCSession *s = NULL;
+  char errbuf[256];
+  int st = orcac_create(&cfg, &s, errbuf, sizeof(errbuf));
+  if (st != ORCAC_OK || s == NULL) {
+    fprintf(stderr, "orcac_create: %s: %s\n", orcac_status_name(st), errbuf);
+    return 2;
+  }
+  double e = 0.0;
+  OrcaCResult meta;
+  memset(&meta, 0, sizeof(meta));
+  meta.struct_size = sizeof(meta);
+  st = orcac_energy_gradient(s, 0, NULL, NULL, ORCAC_WANT_ENERGY, &e, NULL,
+                             &meta);
+  if (st != ORCAC_E_INVALID || meta.message[0] == '\0' ||
+      orcac_last_error(s)[0] == '\0') {
+    fprintf(stderr, "invalid call must fail with a message\n");
+    orcac_destroy(s);
     return 3;
   }
-  if (orcac_configure(pot, NULL) != 0) {
-    fprintf(stderr, "orcac_configure(NULL) failed\n");
-    orcac_destroy(pot);
+  if (orcac_configure(s, &cfg) != ORCAC_OK) {
+    fprintf(stderr, "orcac_configure failed\n");
+    orcac_destroy(s);
     return 3;
   }
-  orcac_destroy(pot);
+  orcac_destroy(s);
   orcac_destroy(NULL);
   printf("installed-consumer ok: %s available=%d\n", version, available);
   return 0;

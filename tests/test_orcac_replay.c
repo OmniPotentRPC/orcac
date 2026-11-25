@@ -125,19 +125,30 @@ static int process_ended(pid_t pid) {
 
 static OrcaCConfig base_config(const char *fake_bin, const char *scratch) {
   OrcaCConfig cfg;
-  memset(&cfg, 0, sizeof(cfg));
+  orcac_config_init(&cfg, sizeof(cfg));
   cfg.method = "HF";
   cfg.basis = "STO-3G";
   cfg.keywords = "TightSCF";
-  cfg.orca_bin = fake_bin;
+  cfg.executable = fake_bin;
   cfg.scratch_dir = scratch;
   cfg.charge = 0;
   cfg.multiplicity = 1;
   cfg.nprocs = 2;
   cfg.maxcore_mb = 400;
-  cfg.timeout_s = 30;
-  cfg.reuse_moread = 1;
+  cfg.timeout_s = 30.0;
+  cfg.guess_policy = ORCAC_GUESS_CHAIN;
   return cfg;
+}
+
+static OrcaCSession *make(const OrcaCConfig *cfg) {
+  OrcaCSession *s = NULL;
+  char errbuf[512];
+  int st = orcac_create(cfg, &s, errbuf, sizeof(errbuf));
+  if (st != ORCAC_OK) {
+    fprintf(stderr, "create: %s: %s\n", orcac_status_name(st), errbuf);
+    return NULL;
+  }
+  return s;
 }
 
 static const double kPos[9] = {0.0, 0.0,     0.1173,  0.0,    0.7572,
@@ -146,17 +157,31 @@ static const int kZ[3] = {8, 1, 1};
 static const double kGrad[9] = {0.020,  -0.010, 0.005,  -0.015, 0.012,
                                 -0.003, -0.005, -0.002, -0.002};
 
-static int check_replay(const OrcaCResult *r, const double *f) {
-  if (!r->ok) {
-    fprintf(stderr, "%s\n", r->message);
-    return fail("compute failed");
+static int eval(OrcaCSession *s, double *e, double *g, OrcaCResult *meta) {
+  memset(meta, 0, sizeof(*meta));
+  meta->struct_size = sizeof(*meta);
+  return orcac_energy_gradient(s, 3, kPos, kZ,
+                               ORCAC_WANT_ENERGY | ORCAC_WANT_GRADIENT, e, g,
+                               meta);
+}
+
+static int check_replay(int st, const OrcaCResult *meta, double e,
+                        const double *g) {
+  if (st != ORCAC_OK || meta->status != ORCAC_OK) {
+    fprintf(stderr, "%s: %s\n", orcac_status_name(st), meta->message);
+    return fail("energy_gradient failed");
   }
-  if (fabs(r->energy_h - (-75.5)) > 1e-12) {
+  if (meta->message[0] != '\0' || meta->orca_runs != 1 ||
+      meta->exit_code != 0) {
+    return fail("meta of a successful call");
+  }
+  if (fabs(e - (-75.5)) > 1e-12) {
     return fail("energy mismatch");
   }
+  /* The gradient is passed through as dE/dx, not negated. */
   for (int i = 0; i < 9; ++i) {
-    if (fabs(f[i] + kGrad[i]) > 1e-12) {
-      return fail("force mismatch");
+    if (fabs(g[i] - kGrad[i]) > 1e-12) {
+      return fail("gradient mismatch");
     }
   }
   return 0;
@@ -170,12 +195,15 @@ int main(int argc, char **argv) {
   char *replay;
   char *log_file;
   char *scratch;
+  char *scratch2;
   char *stray_pidfile;
   char *text;
-  double f[9] = {0};
+  double e = 0.0;
+  double g[9] = {0};
   OrcaCConfig cfg;
-  OrcaCPot *pot;
-  OrcaCResult r;
+  OrcaCSession *pot;
+  OrcaCResult meta;
+  int st;
 
   if (getcwd(cwd, sizeof(cwd)) == NULL) {
     return fail("getcwd failed");
@@ -190,8 +218,9 @@ int main(int argc, char **argv) {
   replay = join(root_dir, "tests/data/orca");
   log_file = join(work, "calls.log");
   scratch = join(work, "scratch");
+  scratch2 = join(work, "scratch2");
   stray_pidfile = join(work, "stray.pid");
-  if (mkdir(scratch, 0755) != 0) {
+  if (mkdir(scratch, 0755) != 0 || mkdir(scratch2, 0755) != 0) {
     return fail("mkdir scratch failed");
   }
 
@@ -200,20 +229,30 @@ int main(int argc, char **argv) {
   unsetenv("ORCAC_FAKE_FAIL");
   unsetenv("ORCAC_FAKE_SLEEP");
   unsetenv("ORCAC_FAKE_STRAY_PIDFILE");
+  unsetenv("ORCAC_ORCA");
 
-  /* Replay, MORead reuse, and scratch cleanup. */
+  /* Replay, MORead chaining, and scratch handling. */
   cfg = base_config(fake_bin, scratch);
-  pot = orcac_create(&cfg);
+  pot = make(&cfg);
   if (pot == NULL) {
     return fail("orcac_create failed");
   }
-  r = orcac_compute(pot, 3, kPos, kZ, f, NULL);
-  if (check_replay(&r, f) != 0) {
+  if (count_entries(scratch) != 1) {
+    return fail("expected the run directory after create");
+  }
+  st = eval(pot, &e, g, &meta);
+  if (check_replay(st, &meta, e, g) != 0) {
     return 1;
   }
-  r = orcac_compute(pot, 3, kPos, kZ, f, NULL);
-  if (check_replay(&r, f) != 0) {
+  if (meta.used_guess != 0 || meta.retried_fresh != 0) {
+    return fail("first call reported a guess");
+  }
+  st = eval(pot, &e, g, &meta);
+  if (check_replay(st, &meta, e, g) != 0) {
     return 1;
+  }
+  if (meta.used_guess != 1) {
+    return fail("second chained call did not use the guess");
   }
   text = slurp(log_file);
   if (text == NULL) {
@@ -225,37 +264,47 @@ int main(int argc, char **argv) {
   if (strstr(text, "! HF STO-3G TightSCF EnGrad MORead\n") == NULL ||
       strstr(text, "%moinp \"orcac_guess0.gbw\"") == NULL ||
       strstr(text, "%pal nprocs 2 end\n") == NULL ||
-      strstr(text, "%maxcore 400\n") == NULL) {
-    return fail("missing MORead, %pal or %maxcore lines");
+      strstr(text, "%maxcore 400\n") == NULL ||
+      strstr(text, "%scf ConvForced true end\n") == NULL) {
+    return fail("missing MORead, %pal, %maxcore or ConvForced lines");
   }
   free(text);
   if (count_entries(scratch) != 1) {
     return fail("expected one run directory after compute");
   }
-  if (orcac_configure(pot, &cfg) != 0) {
+
+  /* A new scratch_dir moves the session and removes the old directory. */
+  cfg.scratch_dir = scratch2;
+  st = orcac_configure(pot, &cfg);
+  if (st != ORCAC_OK) {
+    fprintf(stderr, "%s\n", orcac_last_error(pot));
     return fail("orcac_configure failed");
   }
-  if (count_entries(scratch) != 0) {
-    return fail("orcac_configure leaked the previous run directory");
+  if (count_entries(scratch) != 0 || count_entries(scratch2) != 1) {
+    return fail("orcac_configure did not move the run directory");
   }
 
   /* Failure status and captured tails. */
   setenv("ORCAC_FAKE_FAIL", "3", 1);
-  r = orcac_compute(pot, 3, kPos, kZ, f, NULL);
+  st = eval(pot, &e, g, &meta);
   unsetenv("ORCAC_FAKE_FAIL");
-  if (r.ok) {
-    return fail("failure mode did not fail");
+  if (st != ORCAC_E_ERROR || meta.status != ORCAC_E_ERROR) {
+    return fail("failure mode did not return ORCAC_E_ERROR");
   }
-  if (strstr(r.message, "status 3") == NULL ||
+  if (strstr(meta.message, "status 3") == NULL || meta.exit_code != 3 ||
+      meta.retried_fresh != 0 ||
       strstr(orcac_last_error(pot), "fake orca forced failure") == NULL ||
       strstr(orcac_last_error(pot), "fake orca stderr line") == NULL) {
     return fail("failure message lacks status or output tails");
   }
-  if (strncmp(r.message, orcac_last_error(pot), strlen(r.message)) != 0) {
-    return fail("result message is not a prefix of last_error");
+  if (strncmp(meta.message, orcac_last_error(pot), strlen(meta.message)) != 0) {
+    return fail("meta message is not a prefix of last_error");
+  }
+  if (strcmp(orcac_last_error(NULL), orcac_last_error(pot)) != 0) {
+    return fail("thread-local error differs from the session error");
   }
   orcac_destroy(pot);
-  if (count_entries(scratch) != 0) {
+  if (count_entries(scratch2) != 0) {
     return fail("orcac_destroy leaked the run directory");
   }
 
@@ -273,14 +322,14 @@ int main(int argc, char **argv) {
     keywords[2000] = '\0';
     cfg = base_config(fake_bin, scratch);
     cfg.keywords = keywords;
-    cfg.reuse_moread = 0;
-    pot = orcac_create(&cfg);
+    cfg.guess_policy = ORCAC_GUESS_FRESH;
+    pot = make(&cfg);
     if (pot == NULL) {
       return fail("orcac_create with long keywords failed");
     }
     unlink(log_file);
-    r = orcac_compute(pot, 3, kPos, kZ, f, NULL);
-    if (check_replay(&r, f) != 0) {
+    st = eval(pot, &e, g, &meta);
+    if (check_replay(st, &meta, e, g) != 0) {
       return 1;
     }
     text = slurp(log_file);
@@ -296,71 +345,79 @@ int main(int argc, char **argv) {
     orcac_destroy(pot);
   }
 
-  /* A bad scratch_dir reports a non-empty message. */
+  /* A bad scratch_dir fails at create with a related message. */
   {
     char *bad = join(work, "missing/scratch");
+    char errbuf[512];
+    OrcaCSession *none = NULL;
     cfg = base_config(fake_bin, bad);
-    pot = orcac_create(&cfg);
-    if (pot == NULL) {
-      return fail("orcac_create with bad scratch failed");
+    st = orcac_create(&cfg, &none, errbuf, sizeof(errbuf));
+    if (st != ORCAC_E_ERROR || none != NULL) {
+      return fail("bad scratch_dir did not fail at create");
     }
-    r = orcac_compute(pot, 3, kPos, kZ, f, NULL);
-    if (r.ok) {
-      return fail("bad scratch_dir did not fail");
-    }
-    if (r.message[0] == '\0' || strstr(r.message, "scratch") == NULL ||
-        strstr(orcac_last_error(pot), "scratch") == NULL) {
-      fprintf(stderr, "message: '%s'\n", r.message);
+    if (strstr(errbuf, "scratch") == NULL ||
+        strstr(orcac_last_error(NULL), "scratch") == NULL) {
+      fprintf(stderr, "message: '%s'\n", errbuf);
       return fail("bad scratch_dir message is empty or unrelated");
     }
-    orcac_destroy(pot);
     free(bad);
   }
 
-  /* ORCA_BIN selects the default executable for compute and available. */
+  /* ORCAC_ORCA selects the default executable for create and available. */
   {
     char *missing = join(work, "no-such-orca");
-    setenv("ORCA_BIN", missing, 1);
+    char resolved[4096];
+    OrcaCSession *none = NULL;
+    setenv("ORCAC_ORCA", missing, 1);
     if (orcac_available() != 0) {
-      return fail("orcac_available ignored a missing ORCA_BIN");
-    }
-    setenv("ORCA_BIN", fake_bin, 1);
-    if (orcac_available() != 1) {
-      return fail("orcac_available ignored ORCA_BIN");
+      return fail("orcac_available ignored a missing ORCAC_ORCA");
     }
     cfg = base_config(NULL, scratch);
-    pot = orcac_create(&cfg);
-    if (pot == NULL) {
-      return fail("orcac_create with default orca_bin failed");
+    if (orcac_create(&cfg, &none, NULL, 0) != ORCAC_E_NOT_FOUND ||
+        none != NULL) {
+      return fail("missing ORCAC_ORCA not reported as NOT_FOUND");
     }
-    r = orcac_compute(pot, 3, kPos, kZ, f, NULL);
-    if (check_replay(&r, f) != 0) {
+    setenv("ORCAC_ORCA", fake_bin, 1);
+    if (orcac_available() != 1) {
+      return fail("orcac_available ignored ORCAC_ORCA");
+    }
+    if (orcac_probe_executable(NULL, resolved, sizeof(resolved)) != ORCAC_OK ||
+        resolved[0] != '/' ||
+        strstr(resolved, "tests/data/orca/fake_orca.sh") == NULL) {
+      return fail("probe of the default lookup");
+    }
+    pot = make(&cfg);
+    if (pot == NULL) {
+      return fail("orcac_create with the default executable failed");
+    }
+    st = eval(pot, &e, g, &meta);
+    if (check_replay(st, &meta, e, g) != 0) {
       return 1;
     }
     orcac_destroy(pot);
-    unsetenv("ORCA_BIN");
+    unsetenv("ORCAC_ORCA");
     free(missing);
   }
 
-  /* Timeout escalation ends once the group exits after SIGTERM. */
+  /* A fractional timeout escalates and ends once the group exits. */
   {
     double t0;
     double dt;
     cfg = base_config(fake_bin, scratch);
-    cfg.timeout_s = 1;
-    pot = orcac_create(&cfg);
+    cfg.timeout_s = 0.5;
+    pot = make(&cfg);
     if (pot == NULL) {
       return fail("orcac_create for timeout failed");
     }
     setenv("ORCAC_FAKE_SLEEP", "20", 1);
     t0 = now_s();
-    r = orcac_compute(pot, 3, kPos, kZ, f, NULL);
+    st = eval(pot, &e, g, &meta);
     dt = now_s() - t0;
     unsetenv("ORCAC_FAKE_SLEEP");
-    if (r.ok || strstr(r.message, "timed out") == NULL) {
-      return fail("timeout was not reported");
+    if (st != ORCAC_E_TIMEOUT || strstr(meta.message, "timed out") == NULL) {
+      return fail("timeout was not reported as ORCAC_E_TIMEOUT");
     }
-    if (dt > 2.5) {
+    if (dt > 2.0) {
       fprintf(stderr, "elapsed %.2f s\n", dt);
       return fail("SIGTERM wait was not cut short");
     }
@@ -373,14 +430,14 @@ int main(int argc, char **argv) {
     pid_t stray;
     double t0;
     cfg = base_config(fake_bin, scratch);
-    pot = orcac_create(&cfg);
+    pot = make(&cfg);
     if (pot == NULL) {
       return fail("orcac_create for stray child failed");
     }
     setenv("ORCAC_FAKE_STRAY_PIDFILE", stray_pidfile, 1);
-    r = orcac_compute(pot, 3, kPos, kZ, f, NULL);
+    st = eval(pot, &e, g, &meta);
     unsetenv("ORCAC_FAKE_STRAY_PIDFILE");
-    if (check_replay(&r, f) != 0) {
+    if (check_replay(st, &meta, e, g) != 0) {
       return 1;
     }
     text = slurp(stray_pidfile);
@@ -402,7 +459,7 @@ int main(int argc, char **argv) {
   }
 #endif
 
-  if (count_entries(scratch) != 0) {
+  if (count_entries(scratch) != 0 || count_entries(scratch2) != 0) {
     return fail("run directories leaked");
   }
   remove_tree(work);
@@ -411,6 +468,7 @@ int main(int argc, char **argv) {
   free(replay);
   free(log_file);
   free(scratch);
+  free(scratch2);
   free(stray_pidfile);
   return 0;
 }

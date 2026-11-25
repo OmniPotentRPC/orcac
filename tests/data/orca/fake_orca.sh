@@ -1,6 +1,6 @@
 #!/bin/sh
 # Hand-written stand-in for the ORCA binary. Not an ORCA build and not
-# the output of an ORCA run. test_orcac_replay points orca_bin here.
+# the output of an ORCA run. The tests point executable here.
 # ORCAC_FAKE_REPLAY is the directory holding the synthetic fixtures.
 set -u
 

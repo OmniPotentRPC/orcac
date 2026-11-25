@@ -11,6 +11,7 @@ python = find_program('python3')
 pkgconfig = import('pkgconfig')
 inc = include_directories('include')
 math_dep = cc.find_library('m', required: false)
+threads_dep = dependency('threads')
 
 common_c_args = [
   '-DORCAC_VERSION_STRING="' + meson.project_version() + '"',
@@ -30,7 +31,7 @@ liborcac = library(
     'src/orca_runner.c',
   ],
   include_directories: [inc],
-  dependencies: [math_dep],
+  dependencies: [math_dep, threads_dep],
   c_args: common_c_args + ['-DORCAC_BUILD'],
   gnu_symbol_visibility: 'hidden',
   install: true,
