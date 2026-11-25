@@ -3,6 +3,8 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -109,6 +111,10 @@ char *orcac_file_tail(const char *path, size_t max_bytes) {
   return text;
 }
 
+/*
+ * Next whitespace-separated token, skipping '#' comments. Returns 1 for
+ * a token, 0 at the end of text, -1 for a token that does not fit.
+ */
 static int next_token(const char **cursor, char *token, size_t token_n) {
   const char *p = *cursor;
   size_t n = 0;
@@ -131,14 +137,69 @@ static int next_token(const char **cursor, char *token, size_t token_n) {
     return 0;
   }
   while (*p != '\0' && !isspace((unsigned char)*p) && *p != '#') {
-    if (n + 1u < token_n) {
-      token[n++] = *p;
+    if (n + 1u >= token_n) {
+      *cursor = p;
+      return -1;
     }
+    token[n++] = *p;
     ++p;
   }
   token[n] = '\0';
   *cursor = p;
   return 1;
+}
+
+static int parse_int(const char *token, int *out) {
+  char *end = NULL;
+  long v;
+  errno = 0;
+  v = strtol(token, &end, 10);
+  if (end == token || *end != '\0' || errno == ERANGE || v < INT_MIN ||
+      v > INT_MAX) {
+    return -1;
+  }
+  *out = (int)v;
+  return 0;
+}
+
+/*
+ * Decimal or exponent notation only, no hex, inf or nan, and nothing
+ * left over. Overflow is an error; underflow keeps the value strtod
+ * returns, which is zero or subnormal.
+ */
+static int parse_double(const char *token, double *out) {
+  char *end = NULL;
+  double v;
+  for (const char *p = token; *p != '\0'; ++p) {
+    if (!isdigit((unsigned char)*p) && *p != '+' && *p != '-' && *p != '.' &&
+        *p != 'e' && *p != 'E') {
+      return -1;
+    }
+  }
+  errno = 0;
+  v = strtod(token, &end);
+  if (end == token || *end != '\0' || !isfinite(v) ||
+      (errno == ERANGE && fabs(v) > 1.0)) {
+    return -1;
+  }
+  *out = v;
+  return 0;
+}
+
+static int read_int(const char **cur, int *out) {
+  char token[128];
+  return next_token(cur, token, sizeof(token)) == 1 &&
+                 parse_int(token, out) == 0
+             ? 0
+             : -1;
+}
+
+static int read_double(const char **cur, double *out) {
+  char token[128];
+  return next_token(cur, token, sizeof(token)) == 1 &&
+                 parse_double(token, out) == 0
+             ? 0
+             : -1;
 }
 
 int orcac_parse_engrad(const char *text,
@@ -147,7 +208,6 @@ int orcac_parse_engrad(const char *text,
                        char *errbuf,
                        size_t errbuf_n) {
   const char *cur = text;
-  char token[128];
   int n_atoms;
   int i;
   if (text == NULL || parsed == NULL || expected_atoms <= 0) {
@@ -155,11 +215,11 @@ int orcac_parse_engrad(const char *text,
   }
   memset(parsed, 0, sizeof(*parsed));
 
-  if (!next_token(&cur, token, sizeof(token))) {
-    orcac_errf(errbuf, errbuf_n, "orcac: malformed engrad: missing atom count");
+  if (read_int(&cur, &n_atoms) != 0) {
+    orcac_errf(errbuf, errbuf_n,
+               "orcac: malformed engrad: missing or bad atom count");
     return -1;
   }
-  n_atoms = (int)strtol(token, NULL, 10);
   if (n_atoms != expected_atoms) {
     orcac_errf(errbuf, errbuf_n,
                "orcac: malformed engrad: atom count %d does not match %d",
@@ -168,11 +228,11 @@ int orcac_parse_engrad(const char *text,
   }
   parsed->n_atoms = n_atoms;
 
-  if (!next_token(&cur, token, sizeof(token))) {
-    orcac_errf(errbuf, errbuf_n, "orcac: malformed engrad: missing energy");
+  if (read_double(&cur, &parsed->energy_h) != 0) {
+    orcac_errf(errbuf, errbuf_n,
+               "orcac: malformed engrad: missing or bad energy");
     return -1;
   }
-  parsed->energy_h = strtod(token, NULL);
 
   parsed->gradient_h_bohr = (double *)calloc((size_t)n_atoms * 3u, sizeof(double));
   parsed->atomic_numbers = (int *)calloc((size_t)n_atoms, sizeof(int));
@@ -183,30 +243,33 @@ int orcac_parse_engrad(const char *text,
   }
 
   for (i = 0; i < n_atoms * 3; ++i) {
-    if (!next_token(&cur, token, sizeof(token))) {
+    if (read_double(&cur, &parsed->gradient_h_bohr[i]) != 0) {
       orcac_free_engrad(parsed);
       orcac_errf(errbuf, errbuf_n,
-                 "orcac: malformed engrad: gradient length mismatch");
+                 "orcac: malformed engrad: missing or bad gradient entry %d",
+                 i);
       return -1;
     }
-    parsed->gradient_h_bohr[i] = strtod(token, NULL);
   }
 
   for (i = 0; i < n_atoms; ++i) {
-    if (!next_token(&cur, token, sizeof(token))) {
+    double xyz;
+    if (read_int(&cur, &parsed->atomic_numbers[i]) != 0) {
       orcac_free_engrad(parsed);
       orcac_errf(errbuf, errbuf_n,
-                 "orcac: malformed engrad: missing atomic numbers");
+                 "orcac: malformed engrad: missing or bad atomic number %d",
+                 i);
       return -1;
     }
-    parsed->atomic_numbers[i] = (int)strtol(token, NULL, 10);
-    if (!next_token(&cur, token, sizeof(token)) ||
-        !next_token(&cur, token, sizeof(token)) ||
-        !next_token(&cur, token, sizeof(token))) {
-      orcac_free_engrad(parsed);
-      orcac_errf(errbuf, errbuf_n,
-                 "orcac: malformed engrad: missing coordinates");
-      return -1;
+    for (int k = 0; k < 3; ++k) {
+      if (read_double(&cur, &xyz) != 0) {
+        orcac_free_engrad(parsed);
+        orcac_errf(errbuf, errbuf_n,
+                   "orcac: malformed engrad: missing or bad coordinate of "
+                   "atom %d",
+                   i);
+        return -1;
+      }
     }
   }
 
@@ -229,4 +292,8 @@ int orcac_scf_not_converged(const char *text) {
     }
   }
   return 0;
+}
+
+int orcac_terminated_normally(const char *text) {
+  return text != NULL && strstr(text, "ORCA TERMINATED NORMALLY") != NULL;
 }

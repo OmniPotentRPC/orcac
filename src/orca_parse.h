@@ -25,3 +25,6 @@ char *orcac_file_tail(const char *path, size_t max_bytes);
  * case ConvForced turns into an error termination.
  */
 int orcac_scf_not_converged(const char *text);
+
+/* 1 when ORCA output text carries its normal-termination banner. */
+int orcac_terminated_normally(const char *text);
