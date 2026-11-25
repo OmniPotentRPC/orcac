@@ -1,5 +1,5 @@
 [tool.towncrier]
-package = "orcac"
+name = "orcac"
 filename = "CHANGELOG.md"
 directory = "docs/newsfragments"
 title_format = "## {version} - {project_date}"
