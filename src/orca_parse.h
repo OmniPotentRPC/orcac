@@ -19,3 +19,9 @@ void orcac_free_engrad(OrcacEngrad *parsed);
 
 int orcac_read_file(const char *path, char **text_out);
 char *orcac_file_tail(const char *path, size_t max_bytes);
+
+/*
+ * 1 when ORCA output text reports an SCF that stopped unconverged, the
+ * case ConvForced turns into an error termination.
+ */
+int orcac_scf_not_converged(const char *text);

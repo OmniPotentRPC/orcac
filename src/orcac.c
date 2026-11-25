@@ -251,6 +251,7 @@ OrcaCResult orcac_compute(OrcaCPot *pot, int n_atoms, const double *positions_an
   char guess_name[ORCAC_GUESS_NAME_SIZE];
   OrcacChildResult child;
   OrcacRunOptions run_options;
+  OrcacDeck deck;
   OrcacEngrad parsed;
   int guess_slot = -1;
 
@@ -296,7 +297,15 @@ OrcaCResult orcac_compute(OrcaCPot *pot, int n_atoms, const double *positions_an
     goto fail;
   }
 
-  if (orcac_render_input(&pot->config, n_atoms, positions_ang, atomic_numbers,
+  deck.method = pot->config.method;
+  deck.basis = pot->config.basis;
+  deck.keywords = pot->config.keywords;
+  deck.blocks = NULL;
+  deck.charge = pot->config.charge;
+  deck.multiplicity = pot->config.multiplicity;
+  deck.nprocs = pot->config.nprocs;
+  deck.maxcore_mb = pot->config.maxcore_mb;
+  if (orcac_render_input(&deck, n_atoms, positions_ang, atomic_numbers,
                          guess_slot >= 0 ? guess_name : NULL,
                          &input_text, pot->last_error,
                          sizeof(pot->last_error)) != 0) {
@@ -324,7 +333,14 @@ OrcaCResult orcac_compute(OrcaCPot *pot, int n_atoms, const double *positions_an
     goto fail;
   }
   if (!child.exited || child.exit_code != 0) {
-    if (child.signal != 0) {
+    char *stdout_text = NULL;
+    int scf_failed = orcac_read_file(out, &stdout_text) == 0 &&
+                     orcac_scf_not_converged(stdout_text);
+    free(stdout_text);
+    if (scf_failed) {
+      orcac_set_error(pot, "orcac: ORCA SCF did not converge (exit status %d)",
+                      child.exit_code);
+    } else if (child.signal != 0) {
       orcac_set_error(pot, "orcac: ORCA terminated by signal %d", child.signal);
     } else {
       orcac_set_error(pot, "orcac: ORCA exited with status %d", child.exit_code);

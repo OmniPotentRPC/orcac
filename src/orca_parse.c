@@ -212,3 +212,21 @@ int orcac_parse_engrad(const char *text,
 
   return 0;
 }
+
+int orcac_scf_not_converged(const char *text) {
+  static const char *const markers[] = {
+      "SCF NOT CONVERGED",
+      "SCF DID NOT CONVERGE",
+      "The SCF has not converged",
+      "error termination in SCF",
+  };
+  if (text == NULL) {
+    return 0;
+  }
+  for (size_t i = 0; i < sizeof(markers) / sizeof(markers[0]); ++i) {
+    if (strstr(text, markers[i]) != NULL) {
+      return 1;
+    }
+  }
+  return 0;
+}
