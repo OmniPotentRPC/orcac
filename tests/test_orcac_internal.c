@@ -1085,6 +1085,155 @@ static void test_remove_tree(void) {
   CHECK(rmdir(work) == 0, "work directory left non-empty");
 }
 
+/* Levels the remover pins below its root; ORCAC_REMOVE_MAX_DEPTH. */
+#define CHAIN_MAX_LEVELS 64
+#define CHAIN_NAME_LEN 255
+#define CHAIN_DIR_FLAGS (O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+
+static char chain_name[CHAIN_NAME_LEN + 1];
+
+/*
+ * levels nested directories, each named chain_name, below work_fd, with
+ * a file in the deepest. Made through descriptors: the path is far
+ * longer than PATH_MAX.
+ */
+static int make_deep(int work_fd, int levels) {
+  int fd = dup(work_fd);
+  int ok = fd >= 0;
+  for (int i = 0; i < levels && ok; ++i) {
+    int next = -1;
+    ok = mkdirat(fd, chain_name, 0700) == 0 &&
+         (next = openat(fd, chain_name, CHAIN_DIR_FLAGS)) >= 0;
+    close(fd);
+    fd = ok ? next : -1;
+  }
+  if (ok) {
+    int leaf = openat(fd, "leaf", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+                      0600);
+    ok = leaf >= 0;
+    if (leaf >= 0) {
+      close(leaf);
+    }
+  }
+  if (fd >= 0) {
+    close(fd);
+  }
+  return ok;
+}
+
+/* How many levels of chain_name exist below work_fd. */
+static int deep_levels(int work_fd) {
+  int fd = dup(work_fd);
+  int n = 0;
+  while (fd >= 0) {
+    int next = openat(fd, chain_name, CHAIN_DIR_FLAGS);
+    close(fd);
+    fd = next;
+    n += fd >= 0;
+  }
+  return n;
+}
+
+/* Remove what make_deep made, bottom up, without the remover. */
+static void unmake_deep(int work_fd, int levels) {
+  int fds[CHAIN_MAX_LEVELS + 2];
+  int n = 0;
+  fds[0] = dup(work_fd);
+  while (n < levels && fds[n] >= 0) {
+    fds[n + 1] = openat(fds[n], chain_name, CHAIN_DIR_FLAGS);
+    if (fds[n + 1] < 0) {
+      break;
+    }
+    ++n;
+  }
+  if (fds[n] >= 0) {
+    unlinkat(fds[n], "leaf", 0);
+  }
+  for (int i = n; i >= 1; --i) {
+    close(fds[i]);
+    unlinkat(fds[i - 1], chain_name, AT_REMOVEDIR);
+  }
+  if (fds[0] >= 0) {
+    close(fds[0]);
+  }
+}
+
+typedef struct {
+  int work_fd;
+  int rc;
+  int err;
+} DeepRemoval;
+
+static void *remove_deep(void *arg) {
+  DeepRemoval *r = (DeepRemoval *)arg;
+  errno = 0;
+  r->rc = orcac_remove_tree_at(r->work_fd, chain_name);
+  r->err = errno;
+  return NULL;
+}
+
+/*
+ * One RemoveChain, on the stack of the removal, covers the deepest tree
+ * the remover takes, with names of NAME_MAX bytes at every level: such
+ * a tree goes whole, even from a thread with a stack far smaller than
+ * one chain per level would need, and one level more is refused with
+ * ELOOP and left in place.
+ */
+static void test_remove_chain_stack(void) {
+  char work[] = "orcac-chain-XXXXXX";
+  int work_fd;
+  pthread_t thread;
+  pthread_attr_t attr;
+  DeepRemoval r;
+
+  memset(chain_name, 'd', CHAIN_NAME_LEN);
+  chain_name[CHAIN_NAME_LEN] = '\0';
+  if (mkdtemp(work) == NULL) {
+    fprintf(stderr, "FAIL: mkdtemp\n");
+    ++failures;
+    return;
+  }
+  work_fd = open(work, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  CHECK(work_fd >= 0, "open chain work");
+  if (work_fd < 0) {
+    return;
+  }
+
+  CHECK(make_deep(work_fd, CHAIN_MAX_LEVELS) &&
+            deep_levels(work_fd) == CHAIN_MAX_LEVELS,
+        "make the deepest removable tree");
+  errno = 0;
+  CHECK(orcac_remove_tree_at(work_fd, chain_name) == 0 &&
+            deep_levels(work_fd) == 0,
+        "deepest tree with NAME_MAX names not removed");
+  unmake_deep(work_fd, CHAIN_MAX_LEVELS);
+
+  CHECK(make_deep(work_fd, CHAIN_MAX_LEVELS + 1), "make a too deep tree");
+  errno = 0;
+  CHECK(orcac_remove_tree_at(work_fd, chain_name) != 0 && errno == ELOOP,
+        "tree deeper than the chain not refused with ELOOP");
+  CHECK(deep_levels(work_fd) == CHAIN_MAX_LEVELS + 1,
+        "tree deeper than the chain partly removed");
+  unmake_deep(work_fd, CHAIN_MAX_LEVELS + 1);
+
+  CHECK(make_deep(work_fd, CHAIN_MAX_LEVELS), "make a tree for the thread");
+  r.work_fd = work_fd;
+  r.rc = -1;
+  r.err = 0;
+  CHECK(pthread_attr_init(&attr) == 0 &&
+            pthread_attr_setstacksize(&attr, 512u * 1024u) == 0 &&
+            pthread_create(&thread, &attr, remove_deep, &r) == 0 &&
+            pthread_join(thread, NULL) == 0,
+        "run a removal on a small stack");
+  pthread_attr_destroy(&attr);
+  CHECK(r.rc == 0 && deep_levels(work_fd) == 0,
+        "deepest tree not removed from a small stack");
+  unmake_deep(work_fd, CHAIN_MAX_LEVELS);
+
+  close(work_fd);
+  CHECK(rmdir(work) == 0, "chain work directory left non-empty");
+}
+
 static void remove_by_path(const char *dir, const char *name) {
   int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
   CHECK(fd >= 0 && orcac_remove_tree_at(fd, name) == 0, name);
@@ -1302,6 +1451,22 @@ static void test_session_alloc_stuck(const char *scratch) {
     close(parent_fd);
   }
   CHECK(entry_count(scratch) == before, "scratch not back to its entries");
+
+  /*
+   * The chain itself takes no allocation: removing an entry that needs
+   * no directory stream still works while every allocation fails.
+   */
+  snprintf(tree, sizeof(tree), "%s/stuck-file", scratch);
+  write_file(tree, "stuck");
+  parent_fd = open(scratch, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  orcac_test_alloc_stuck = 1;
+  CHECK(parent_fd >= 0 && orcac_remove_tree_at(parent_fd, "stuck-file") == 0 &&
+            access(tree, F_OK) != 0,
+        "file not removed with allocation failing for good");
+  orcac_test_alloc_stuck = 0;
+  if (parent_fd >= 0) {
+    close(parent_fd);
+  }
 
   for (int k = 1; k <= 16 && !opened; ++k) {
     int rc;
@@ -1766,6 +1931,7 @@ int main(int argc, char **argv) {
   CHECK(entry_count(scratch) == 0, "scratch directory left non-empty");
   rmdir(scratch);
   test_remove_tree();
+  test_remove_chain_stack();
 
   if (failures != 0) {
     fprintf(stderr, "%d check(s) failed\n", failures);
