@@ -4,7 +4,8 @@
   "description": "ORCA C ABI split engine for rgpot.",
   "folders": [
     "docs",
-    "include"
+    "include",
+    "examples"
   ],
   "excludeFolders": [
     "docs/newsfragments",
