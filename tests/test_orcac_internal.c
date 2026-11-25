@@ -604,8 +604,11 @@ static void test_remove_tree(void) {
     CHECK(a_fd >= 0 && orcac_remove_tree_below(fd, a_fd, 1, "b") == 0 &&
               file_is(path, "f1", "f1"),
           "remove a/b below the root");
-    snprintf(moved, sizeof(moved), "%s/b", path);
-    CHECK(access(moved, F_OK) != 0, "a/b left behind");
+    {
+      char gone[sizeof(path) + 8];
+      snprintf(gone, sizeof(gone), "%s/b", path);
+      CHECK(access(gone, F_OK) != 0, "a/b left behind");
+    }
     if (a_fd >= 0) {
       close(a_fd);
     }
