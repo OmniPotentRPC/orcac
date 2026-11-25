@@ -1,0 +1,16 @@
+{
+  "$schema": "https://context7.com/schema/context7.json",
+  "projectTitle": "orcac",
+  "description": "ORCA C ABI split engine for rgpot.",
+  "excludeFolders": [
+    "docs/newsfragments",
+    "subprojects",
+    "tests"
+  ],
+  "excludeFiles": [
+    "CHANGELOG.md",
+    "LICENSE",
+    "meson_options.txt"
+  ],
+  "rules": []
+}
