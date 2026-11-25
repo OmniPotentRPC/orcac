@@ -6,7 +6,7 @@ on:
 
 jobs:
   build-test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Install build tools
@@ -23,7 +23,7 @@ jobs:
         run: python3 scripts/build_docs.py
 
   sanitize:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -37,8 +37,9 @@ jobs:
       - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y meson ninja-build pkg-config python3 clang \
-            libclang-rt-18-dev
+          sudo apt-get install -y meson ninja-build pkg-config python3 clang
+          clang_major=$(clang -dumpversion | cut -d. -f1)
+          sudo apt-get install -y "libclang-rt-${clang_major}-dev"
       - name: Configure
         run: >-
           meson setup build-san
@@ -51,7 +52,7 @@ jobs:
 
   orca-optional:
     if: ${{ vars.ORCAC_ORCA != '' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       ORCAC_ORCA: ${{ vars.ORCAC_ORCA }}
     steps:
