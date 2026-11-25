@@ -370,7 +370,7 @@ static char swap_root[PATH_MAX + 16];
 static void swap_on_open(int dirfd, const char *name) {
   char from[PATH_MAX + 64];
   char moved[PATH_MAX + 64];
-  if (strcmp(name, swap_trigger) != 0 || swap_calls++ != 0) {
+  if (name == NULL || strcmp(name, swap_trigger) != 0 || swap_calls++ != 0) {
     return;
   }
   snprintf(moved, sizeof(moved), "%s/%s", swap_outside, swap_dest);
@@ -383,6 +383,22 @@ static void swap_on_open(int dirfd, const char *name) {
   } else {
     snprintf(from, sizeof(from), "%s/a", swap_root);
     CHECK(rename(from, moved) == 0, "move the ancestor a out");
+  }
+}
+
+static int refill_calls = 0;
+
+/* A new file appears each time the walk starts reading a directory. */
+static void refill_on_scan(int dirfd, const char *name) {
+  char fresh[32];
+  int fd;
+  if (name != NULL || refill_calls >= 1000) {
+    return;
+  }
+  snprintf(fresh, sizeof(fresh), "n%d", ++refill_calls);
+  fd = openat(dirfd, fresh, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  if (fd >= 0) {
+    close(fd);
   }
 }
 
@@ -539,6 +555,28 @@ static void test_remove_tree(void) {
   CHECK(file_is(moved, "b/g", "g"),
         "file below a moved-out ancestor unlinked");
   CHECK(tree_intact(outside), "outside tree touched by the unlink race");
+
+  /* Files that keep reappearing outlast the passes: -1 and EAGAIN. */
+  snprintf(path, sizeof(path), "%s/n0", root);
+  write_file(path, "n0");
+  refill_calls = 0;
+  orcac_test_remove_hook = refill_on_scan;
+  fd = open(root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  errno = 0;
+  rc = fd >= 0 ? orcac_empty_dir(fd) : -1;
+  CHECK(rc != 0 && errno == EAGAIN,
+        "directory refilled during removal reported as emptied");
+  CHECK(refill_calls > 0 && entry_count(root) > 0, "refill hook not reached");
+  orcac_test_remove_hook = NULL;
+  if (fd >= 0) {
+    close(fd);
+  }
+  fd = open(root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  CHECK(fd >= 0 && orcac_empty_dir(fd) == 0 && entry_count(root) == 0,
+        "empty the root once the refill stops");
+  if (fd >= 0) {
+    close(fd);
+  }
 
   /* dirfd must sit exactly level steps below root_fd. */
   snprintf(path, sizeof(path), "%s/a", root);

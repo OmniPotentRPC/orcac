@@ -81,7 +81,9 @@ int orcac_run_orca(const char *executable,
  * for a symlink mid-walk is never entered, and once a subtree or any of
  * its ancestors has been moved out from under root_fd, or an entry sits
  * on another device, the rest is left in place with -1 and EXDEV.
- * A missing entry is 0. On -1, errno holds the first failure.
+ * A directory that still holds entries after a bounded number of passes,
+ * because new ones keep appearing, is -1 with EAGAIN. A missing entry is
+ * 0. On -1, errno holds the first failure.
  */
 int orcac_remove_tree_below(int root_fd, int dirfd, int level,
                             const char *name);
@@ -95,7 +97,9 @@ int orcac_empty_dir(int dirfd);
 #ifdef ORCAC_TEST_HOOKS
 /*
  * Called after a subdirectory is opened, before it is checked and
- * emptied, and before a non-directory is checked and unlinked.
+ * emptied, and before a non-directory is checked and unlinked. Called
+ * with name NULL each time the walk starts reading the directory open
+ * at dirfd, including its final check that nothing is left.
  */
 extern void (*orcac_test_remove_hook)(int dirfd, const char *name);
 #endif

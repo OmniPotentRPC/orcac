@@ -654,11 +654,13 @@ static int remove_entry_at(int dirfd, const struct stat *root, int level,
  * root, and close fd. Each entry is opened relative to fd with
  * O_NOFOLLOW, so a symlink is unlinked itself and a directory swapped
  * for a symlink is never entered. The walk stops once fd is no longer
- * where it was below root.
+ * where it was below root. Entries still present after the last pass
+ * are -1 with EAGAIN.
  */
 static int empty_dir_fd(int fd, const struct stat *root, int level) {
   DIR *dir = fdopendir(fd);
   int first = 0;
+  int empty = 0;
   if (dir == NULL) {
     int saved = errno;
     close(fd);
@@ -670,6 +672,7 @@ static int empty_dir_fd(int fd, const struct stat *root, int level) {
     int seen = 0;
     int removed = 0;
     rewinddir(dir);
+    call_remove_hook(dirfd(dir), NULL);
     for (;;) {
       errno = 0;
       ent = readdir(dir);
@@ -693,9 +696,22 @@ static int empty_dir_fd(int fd, const struct stat *root, int level) {
         first = keep_errno(first, errno);
       }
     }
-    if (seen == 0 || removed == 0 || first != 0) {
+    if (seen == 0) {
+      empty = 1;
       break;
     }
+    if (removed == 0 || first != 0) {
+      break;
+    }
+  }
+  if (first == 0 && !empty) {
+    struct dirent *ent;
+    rewinddir(dir);
+    call_remove_hook(dirfd(dir), NULL);
+    errno = 0;
+    while ((ent = readdir(dir)) != NULL && is_dot_name(ent->d_name)) {
+    }
+    first = ent != NULL ? EAGAIN : errno;
   }
   closedir(dir);
   if (first != 0) {
