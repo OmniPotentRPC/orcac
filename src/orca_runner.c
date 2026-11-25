@@ -180,6 +180,7 @@ static void random_suffix(char *out, size_t n, unsigned int attempt) {
 
 #ifdef ORCAC_TEST_HOOKS
 void (*orcac_test_run_dir_hook)(int parent_fd, const char *name) = NULL;
+void (*orcac_test_private_dir_hook)(int dirfd, const char *name) = NULL;
 #endif
 
 /* 1 when the directory open at fd holds nothing, 0 when it does, else -1. */
@@ -235,6 +236,11 @@ int orcac_check_private_dir(int dirfd, const char *name, int fd,
   if (!need_empty) {
     return 0;
   }
+#ifdef ORCAC_TEST_HOOKS
+  if (orcac_test_private_dir_hook != NULL) {
+    orcac_test_private_dir_hook(dirfd, name);
+  }
+#endif
   empty = dir_is_empty(fd);
   if (empty != 1) {
     if (empty == 0) {

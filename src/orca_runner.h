@@ -158,6 +158,12 @@ extern void (*orcac_test_remove_hook)(int dirfd, const char *name);
 extern void (*orcac_test_run_dir_hook)(int parent_fd, const char *name);
 
 /*
+ * Called by orcac_check_private_dir, when it checks emptiness, once the
+ * entry has been checked and before the directory is read.
+ */
+extern void (*orcac_test_private_dir_hook)(int dirfd, const char *name);
+
+/*
  * While nonzero, allocation has failed for good: the remover cannot
  * open a directory stream and every path allocation of the session
  * fails, each with ENOMEM.
