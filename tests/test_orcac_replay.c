@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include "test_locale.h"
 
 static int fail(const char *msg) {
   fprintf(stderr, "FAIL: %s\n", msg);
@@ -236,6 +237,7 @@ int main(int argc, char **argv) {
   OrcaCResult meta;
   int st;
 
+  orcac_test_apply_locale();
   if (getcwd(cwd, sizeof(cwd)) == NULL) {
     return fail("getcwd failed");
   }

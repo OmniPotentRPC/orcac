@@ -1,7 +1,7 @@
 #include "orca_parse.h"
+#include "orcac_clocale.h"
 #include "orcac_errbuf.h"
 
-#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -131,6 +131,16 @@ char *orcac_file_tail_at(int dirfd, const char *name, size_t max_bytes) {
   return text;
 }
 
+/* isspace and isdigit without the locale. */
+static int ascii_space(unsigned char c) {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' ||
+         c == '\r';
+}
+
+static int ascii_digit(unsigned char c) {
+  return c >= '0' && c <= '9';
+}
+
 /*
  * Next whitespace-separated token, skipping '#' comments. Returns 1 for
  * a token, 0 at the end of text, -1 for a token that does not fit.
@@ -147,7 +157,7 @@ static int next_token(const char **cursor, char *token, size_t token_n) {
     if (*p == '\0') {
       break;
     }
-    if (!isspace((unsigned char)*p)) {
+    if (!ascii_space((unsigned char)*p)) {
       break;
     }
     ++p;
@@ -156,7 +166,7 @@ static int next_token(const char **cursor, char *token, size_t token_n) {
     *cursor = p;
     return 0;
   }
-  while (*p != '\0' && !isspace((unsigned char)*p) && *p != '#') {
+  while (*p != '\0' && !ascii_space((unsigned char)*p) && *p != '#') {
     if (n + 1u >= token_n) {
       *cursor = p;
       return -1;
@@ -185,13 +195,14 @@ static int parse_int(const char *token, int *out) {
 /*
  * Decimal or exponent notation only, no hex, inf or nan, and nothing
  * left over. Overflow is an error; underflow keeps the value strtod
- * returns, which is zero or subnormal.
+ * returns, which is zero or subnormal. Callers hold the C numeric
+ * locale, so '.' is the decimal point whatever the host set.
  */
 static int parse_double(const char *token, double *out) {
   char *end = NULL;
   double v;
   for (const char *p = token; *p != '\0'; ++p) {
-    if (!isdigit((unsigned char)*p) && *p != '+' && *p != '-' && *p != '.' &&
+    if (!ascii_digit((unsigned char)*p) && *p != '+' && *p != '-' && *p != '.' &&
         *p != 'e' && *p != 'E') {
       return -1;
     }
@@ -222,11 +233,8 @@ static int read_double(const char **cur, double *out) {
              : -1;
 }
 
-int orcac_parse_engrad(const char *text,
-                       int expected_atoms,
-                       OrcacEngrad *parsed,
-                       char *errbuf,
-                       size_t errbuf_n) {
+static int parse_engrad(const char *text, int expected_atoms,
+                        OrcacEngrad *parsed, char *errbuf, size_t errbuf_n) {
   const char *cur = text;
   int n_atoms;
   int i;
@@ -294,6 +302,27 @@ int orcac_parse_engrad(const char *text,
   }
 
   return 0;
+}
+
+int orcac_parse_engrad(const char *text,
+                       int expected_atoms,
+                       OrcacEngrad *parsed,
+                       char *errbuf,
+                       size_t errbuf_n) {
+  OrcacCNumeric c_numeric;
+  int rc;
+  if (text == NULL || parsed == NULL || expected_atoms <= 0) {
+    return -1;
+  }
+  if (orcac_c_numeric_enter(&c_numeric) != 0) {
+    memset(parsed, 0, sizeof(*parsed));
+    orcac_errf(errbuf, errbuf_n,
+               "orcac: could not switch to the C numeric locale");
+    return -1;
+  }
+  rc = parse_engrad(text, expected_atoms, parsed, errbuf, errbuf_n);
+  orcac_c_numeric_leave(&c_numeric);
+  return rc;
 }
 
 /* tolower without the locale, so only A-Z change. */
@@ -367,10 +396,10 @@ static int is_echo_line(const char *line, const char *end) {
   while (p < end && *p == ' ') {
     ++p;
   }
-  if (p == end || !isdigit((unsigned char)*p)) {
+  if (p == end || !ascii_digit((unsigned char)*p)) {
     return 0;
   }
-  while (p < end && isdigit((unsigned char)*p)) {
+  while (p < end && ascii_digit((unsigned char)*p)) {
     ++p;
   }
   return p < end && *p == '>';

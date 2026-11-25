@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "test_locale.h"
 
 static int failures = 0;
 
@@ -226,6 +227,8 @@ static void test_termination_banner(const char *root) {
 
 int main(int argc, char **argv) {
   const char *root = argc > 1 ? argv[1] : ".";
+
+  orcac_test_apply_locale();
   test_scf_banner(root);
   test_termination_banner(root);
   if (failures != 0) {

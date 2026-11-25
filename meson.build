@@ -115,6 +115,25 @@ if get_option('with_tests')
   test('orca_real_optional', test_real_optional, suite: ['optional-orca'])
 
   test(
+    'comma-locale',
+    python,
+    args: [
+      meson.current_source_dir() / 'tests/run_comma_locale.py',
+      '--source-dir',
+      meson.current_source_dir(),
+      test_stub,
+      test_replay,
+      test_abi,
+      test_internal,
+      test_parse,
+      test_real_optional,
+    ],
+    is_parallel: false,
+    timeout: 300,
+    suite: ['locale'],
+  )
+
+  test(
     'readme-abi-surface',
     python,
     args: [meson.current_source_dir() / 'tests/test_readme_abi_surface.py'],

@@ -1,12 +1,14 @@
 /*
  * Library internals, built from the sources with ORCAC_TEST_HOOKS:
- * strict engrad number parsing, guess-cache eviction order, a cancel
+ * strict engrad number parsing, numbers under a host's comma-decimal
+ * LC_NUMERIC on several threads, guess-cache eviction order, a cancel
  * issued in the window after a call has taken the session lock but
  * before ORCA starts, and tree removal while directories are swapped
  * for symlinks or moved out.
  */
 #include <orcac.h>
 
+#include "orca_input.h"
 #include "orca_parse.h"
 #include "orca_runner.h"
 #include "orcac_cache.h"
@@ -17,12 +19,15 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <locale.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "test_locale.h"
 
 static int failures = 0;
 
@@ -151,6 +156,127 @@ static void test_parse(void) {
             !orcac_terminated_normally("ORCA TERMINATED") &&
             !orcac_terminated_normally(NULL),
         "normal-termination banner");
+}
+
+static const char *const kCommaLocales[] = {
+    "de_DE.UTF-8", "de_DE.utf8", "de_DE", "fr_FR.UTF-8", "fr_FR.utf8",
+    "nl_NL.UTF-8", "nl_NL.utf8", "it_IT.UTF-8", "it_IT.utf8"};
+
+static int comma_decimal(void) {
+  struct lconv *lc = localeconv();
+  return lc != NULL && strcmp(lc->decimal_point, ",") == 0;
+}
+
+/* One render and parse; 0 when both use '.' and agree with the input. */
+static int numbers_round_trip(void) {
+  OrcacDeck deck;
+  OrcacEngrad parsed;
+  char err[256];
+  char *text = NULL;
+  int ok;
+  memset(&deck, 0, sizeof(deck));
+  deck.method = "HF";
+  deck.basis = "STO-3G";
+  if (orcac_render_input(&deck, 3, kPos, kZ, NULL, &text, err,
+                         sizeof(err)) != 0) {
+    return -1;
+  }
+  ok = strstr(text, "0.1173000000") != NULL &&
+       strstr(text, "-0.7572000000 -0.4692000000") != NULL &&
+       strchr(text, ',') == NULL;
+  free(text);
+  if (!ok ||
+      parses("3", "-75.5", "0.02", "8", "0.22", &parsed, err,
+             sizeof(err)) != 0) {
+    return -1;
+  }
+  ok = parsed.energy_h == -75.5 && parsed.gradient_h_bohr[0] == 0.02 &&
+       parsed.gradient_h_bohr[1] == -0.01;
+  orcac_free_engrad(&parsed);
+  return ok ? 0 : -1;
+}
+
+typedef struct LocaleWorker {
+  const char *own_locale; /* NULL runs under the global locale */
+  int failed;
+} LocaleWorker;
+
+static void *locale_worker(void *arg) {
+  LocaleWorker *w = (LocaleWorker *)arg;
+  locale_t own = (locale_t)0;
+  locale_t prev = (locale_t)0;
+  if (w->own_locale != NULL) {
+    own = newlocale(LC_NUMERIC_MASK, w->own_locale, (locale_t)0);
+    if (own == (locale_t)0) {
+      w->failed = 1;
+      return NULL;
+    }
+    prev = uselocale(own);
+  }
+  for (int i = 0; i < 200 && !w->failed; ++i) {
+    if (numbers_round_trip() != 0 || !comma_decimal() ||
+        (own != (locale_t)0 && uselocale((locale_t)0) != own)) {
+      w->failed = 1;
+    }
+  }
+  if (own != (locale_t)0) {
+    uselocale(prev);
+    freelocale(own);
+  }
+  return NULL;
+}
+
+/*
+ * An embedding host that switched LC_NUMERIC to a comma locale, either
+ * globally with setlocale or per thread with uselocale, still gets '.'
+ * in the deck and has ORCA's '.' parsed, and finds its own locale in
+ * place after every call, on every thread at once.
+ */
+static void test_host_locale(void) {
+  char saved[256];
+  const char *found = NULL;
+  const char *cur = setlocale(LC_NUMERIC, NULL);
+  pthread_t threads[4];
+  LocaleWorker workers[4];
+  int started = 0;
+
+  if (cur == NULL || strlen(cur) >= sizeof(saved)) {
+    CHECK(0, "query LC_NUMERIC");
+    return;
+  }
+  memcpy(saved, cur, strlen(cur) + 1u);
+  for (size_t i = 0; i < sizeof(kCommaLocales) / sizeof(kCommaLocales[0]);
+       ++i) {
+    if (setlocale(LC_NUMERIC, kCommaLocales[i]) != NULL && comma_decimal()) {
+      found = kCommaLocales[i];
+      break;
+    }
+  }
+  if (found == NULL) {
+    setlocale(LC_NUMERIC, saved);
+    fprintf(stdout, "skip: no comma-decimal locale for the host test\n");
+    return;
+  }
+  CHECK(numbers_round_trip() == 0, "numbers under a comma LC_NUMERIC");
+  CHECK(comma_decimal(), "host LC_NUMERIC not restored");
+
+  for (int i = 0; i < 4; ++i) {
+    workers[i].own_locale = (i % 2) ? found : NULL;
+    workers[i].failed = 0;
+    if (pthread_create(&threads[i], NULL, locale_worker, &workers[i]) != 0) {
+      CHECK(0, "pthread_create");
+      break;
+    }
+    ++started;
+  }
+  for (int i = 0; i < started; ++i) {
+    pthread_join(threads[i], NULL);
+    CHECK(!workers[i].failed, workers[i].own_locale != NULL
+                                  ? "thread with its own comma locale"
+                                  : "thread under the global comma locale");
+  }
+  CHECK(comma_decimal(), "host LC_NUMERIC changed by worker threads");
+  setlocale(LC_NUMERIC, saved);
 }
 
 static void write_file(const char *path, const char *text) {
@@ -777,7 +903,9 @@ int main(int argc, char **argv) {
   char scratch[] = "orcac-internal-XXXXXX";
   const char *root = argc > 1 ? argv[1] : ".";
 
+  orcac_test_apply_locale();
   test_parse();
+  test_host_locale();
 
   snprintf(fake_bin, sizeof(fake_bin), "%s/tests/data/orca/fake_orca.sh",
            root);

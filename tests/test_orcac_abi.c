@@ -22,6 +22,7 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include "test_locale.h"
 
 static int failures = 0;
 
@@ -1353,6 +1354,7 @@ int main(int argc, char **argv) {
   const char *root_dir;
   char *replay;
 
+  orcac_test_apply_locale();
   if (getcwd(cwd, sizeof(cwd)) == NULL) {
     fprintf(stderr, "FAIL: getcwd\n");
     return 1;

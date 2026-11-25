@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "test_locale.h"
 
 /* 1 cm^-1 in Eh. */
 #define SPECTROSCOPIC_EH 4.6e-6
@@ -23,6 +24,7 @@ int main(void) {
   double g_first[6] = {0};
   int st;
 
+  orcac_test_apply_locale();
   if (orca == NULL || orca[0] == '\0') {
     fprintf(stdout, "skip: ORCAC_ORCA is not set\n");
     return 0;
