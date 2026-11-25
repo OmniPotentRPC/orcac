@@ -6,4 +6,5 @@ run and could carry its files outside the session tree. The move now
 happens only while the root's `run` and `keep` entries are still the
 pinned directories; a renamed, replaced or symlinked `keep/` is refused
 with `EXDEV` and the files stay in `run/`, and a `keep/` that leaves the
-root right before the rename has the files moved back.
+root right before the rename has the files moved back, or the call
+fails with an error other than `EXDEV` when they cannot be.

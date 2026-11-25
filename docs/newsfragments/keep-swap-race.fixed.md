@@ -1,8 +1,16 @@
-Moving a failed run to `keep/failed` now checks both ends of the
-`renameat` by device and inode afterwards. Before, a `run/` swapped for
-a decoy right before the rename left the decoy in `keep/failed`, and a
-`keep/` that left the root when the files could not be moved back was
-reported as `EXDEV`, which promises that nothing left the session tree.
-A decoy taken by the rename now goes back to the root's `run` entry,
-and a move back that fails is reported with its own error, never
-`EXDEV`, or with `EIO` when the files moved back are no longer `run/`.
+Moving a failed run to `keep/failed` now pins what the `renameat` put
+there, by type, device and inode, as soon as it returns, and keeps the
+run only when that is the pinned `run/`, still in `keep/failed`, with
+`keep/` still in the root. Before, a `run/` swapped for a decoy right
+before the rename left the decoy in `keep/failed`, and a `keep/` that
+left the root when the files could not be moved back was reported as
+`EXDEV`. Anything else the rename took, the run's files in a `keep/`
+that left the root or a decoy, is now renamed back to the root's `run`
+entry, and `EXDEV` is returned only once that entry is the pinned
+object again; for a decoy the run's files are wherever whoever swapped
+`run/` moved them. A `keep/failed` that no longer holds the pinned
+object is not moved back and fails with `EIO`, as does a move back that
+leaves another object as `run/`; a move back that fails reports its own
+error, `EIO` in place of `EXDEV`. The pinned object then stays where it
+was left, and the session's `run/` descriptor is never reopened by name
+on an entry it did not make or verify.
