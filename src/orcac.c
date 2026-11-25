@@ -1,998 +1,989 @@
-#include <orcac.h>
+/* Sessions and the public C ABI of liborcac. */
+#if !defined(_GNU_SOURCE) && !defined(__APPLE__)
+#define _GNU_SOURCE
+#endif
 
-#include "orca_input.h"
-#include "orca_parse.h"
-#include "orca_runner.h"
-#include "orcac_errbuf.h"
+#include "orcac.h"
 #include "orcac_internal.h"
 
 #include <errno.h>
+#include <ftw.h>
 #include <limits.h>
-#include <math.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
+
+#ifndef ORCAC_VERSION_STRING
+#define ORCAC_VERSION_STRING "0.0.0"
+#endif
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
 
-/* Leaves room for both tails in last_error after a short leading error. */
-#define ORCAC_TAIL_BYTES 1536
-#define ORCAC_MAX_ATOMS 1000000
+#define ORCAC_ERR_CAP 8192
+/* How much of ORCA's stderr and output an error message carries. */
+#define ORCAC_TAIL_BYTES 2048
 
-#define ORCAC_FLAGS_KNOWN                                                     \
-  (ORCAC_F_NO_FRESH_RETRY | ORCAC_F_KEEP_MPI_ENV |                            \
-   ORCAC_F_ALLOW_NEAR_CONVERGED)
-#define ORCAC_WANT_KNOWN                                                      \
-  (ORCAC_WANT_ENERGY | ORCAC_WANT_GRADIENT | ORCAC_WANT_STRESS)
+static const char k_base[] = "orcac";
+static const char k_guess[] = "orcac_guess.gbw";
 
-#ifndef ORCAC_VERSION_STRING
-#define ORCAC_VERSION_STRING "0.1.0"
-#endif
+static _Thread_local char g_last_error[ORCAC_ERR_CAP] = "";
 
-static _Thread_local char tls_error[ORCAC_LAST_ERROR_SIZE];
+void orcac_set_error(const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(g_last_error, sizeof(g_last_error), fmt, ap);
+  va_end(ap);
+}
 
-typedef struct RunPaths {
-  char *inp;
-  char *out;
-  char *err;
-  char *engrad;
-  char *gbw;
-} RunPaths;
+struct OrcaCSession {
+  orcac_config cfg;
+  char *exe;
+  char *run_dir;
+  int has_guess;
+  int last_reused;
+  int *guess_numbers;
+  int guess_n;
+  char *error;
+};
 
-static char *dup_string(const char *src) {
-  size_t n;
-  char *out;
-  if (src == NULL) {
-    src = "";
-  }
-  n = strlen(src);
-  out = (char *)malloc(n + 1);
-  if (out == NULL) {
-    return NULL;
-  }
-  memcpy(out, src, n + 1);
+/* ---- small helpers ---- */
+
+static char *dup_str(const char *s) {
+  const size_t n = strlen(s);
+  char *out = malloc(n + 1);
+  if (out)
+    memcpy(out, s, n + 1);
   return out;
 }
 
-static void copy_text(char *dst, size_t dst_n, const char *src) {
-  size_t n;
-  if (dst == NULL || dst_n == 0) {
-    return;
-  }
-  if (src == NULL) {
-    src = "";
-  }
-  n = strlen(src);
-  if (n >= dst_n) {
-    n = dst_n - 1u;
-  }
-  memmove(dst, src, n);
-  dst[n] = '\0';
-}
-
-static int safe_unlink(const char *path) {
-  if (unlink(path) != 0 && errno != ENOENT) {
-    return -1;
-  }
-  return 0;
-}
-
-static char *join_path2(const char *a, const char *b) {
-  size_t na = strlen(a);
-  size_t nb = strlen(b);
-  char *out = (char *)malloc(na + nb + 2u);
-  if (out == NULL) {
+static char *join_path(const char *dir, const char *name) {
+  const size_t a = strlen(dir), b = strlen(name);
+  char *out = malloc(a + b + 2);
+  if (!out)
     return NULL;
-  }
-  memcpy(out, a, na);
-  out[na] = '/';
-  memcpy(out + na + 1u, b, nb + 1u);
+  memcpy(out, dir, a);
+  out[a] = '/';
+  memcpy(out + a + 1, name, b + 1);
   return out;
 }
 
-static int write_text_file(const char *path, const char *text, char *errbuf,
-                           size_t errbuf_n) {
-  FILE *fp = fopen(path, "wb");
-  if (fp == NULL) {
-    orcac_errf(errbuf, errbuf_n, "orcac: could not write %s: %s", path,
-               strerror(errno));
+static char *run_file(const OrcaCSession *s, const char *suffix) {
+  char name[64];
+  snprintf(name, sizeof(name), "%s%s", k_base, suffix);
+  return join_path(s->run_dir, name);
+}
+
+static int is_executable_file(const char *path) {
+  struct stat st;
+  if (stat(path, &st) != 0)
+    return 0;
+  return S_ISREG(st.st_mode) && access(path, X_OK) == 0;
+}
+
+static int is_directory(const char *path) {
+  struct stat st;
+  return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+/* Absolute form of path without resolving symlinks. */
+static int absolute_path(const char *path, char *out, size_t cap) {
+  if (path[0] == '/') {
+    if (strlen(path) + 1 > cap)
+      return -1;
+    memcpy(out, path, strlen(path) + 1);
+    return 0;
+  }
+  char cwd[PATH_MAX];
+  if (!getcwd(cwd, sizeof(cwd)))
     return -1;
-  }
-  if (fputs(text, fp) == EOF || fflush(fp) != 0) {
-    fclose(fp);
-    orcac_errf(errbuf, errbuf_n, "orcac: write failed for %s", path);
-    return -1;
-  }
-  fclose(fp);
-  return 0;
+  const int n = snprintf(out, cap, "%s/%s", cwd, path);
+  return (n < 0 || (size_t)n >= cap) ? -1 : 0;
 }
 
-static double now_s(void) {
-  struct timespec ts;
-  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
-    return 0.0;
+static char *read_file(const char *path, size_t *length) {
+  *length = 0;
+  FILE *f = fopen(path, "rb");
+  if (!f)
+    return NULL;
+  size_t cap = 4096, len = 0;
+  char *buf = malloc(cap);
+  if (!buf) {
+    fclose(f);
+    return NULL;
   }
-  return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
-}
-
-/*
- * Record the outcome of a call: the thread-local text always, the
- * session text only when the caller holds the session lock, and meta
- * when given. msg may point into any of those buffers.
- */
-static int finish(OrcaCSession *held, OrcaCResult *meta, int status,
-                  const char *msg) {
-  char local[ORCAC_LAST_ERROR_SIZE];
-  copy_text(local, sizeof(local), status == ORCAC_OK ? "" : msg);
-  copy_text(tls_error, sizeof(tls_error), local);
-  if (held != NULL) {
-    copy_text(held->last_error, sizeof(held->last_error), local);
-  }
-  if (meta != NULL) {
-    meta->status = status;
-    copy_text(meta->message, sizeof(meta->message), local);
-  }
-  return status;
-}
-
-static int reject_foreign(const OrcaCSession *s, OrcaCResult *meta) {
-  char msg[160];
-  snprintf(msg, sizeof(msg),
-           "orcac: session belongs to process %ld, called from %ld",
-           (long)s->owner_pid, (long)getpid());
-  return finish(NULL, meta, ORCAC_E_INVALID, msg);
-}
-
-static void default_config(OrcaCConfig *cfg) {
-  memset(cfg, 0, sizeof(*cfg));
-  cfg->magic = ORCAC_CONFIG_MAGIC;
-  cfg->version = ORCAC_CONFIG_VERSION;
-  cfg->struct_size = sizeof(*cfg);
-  cfg->multiplicity = 1;
-  cfg->nprocs = 1;
-  cfg->guess_policy = ORCAC_GUESS_FRESH;
-}
-
-/*
- * Check the header of in and copy the struct_size bytes this library
- * knows into out over the defaults, so fields an older caller lacks keep
- * their orcac_config_init values.
- */
-static int read_config(const OrcaCConfig *in, OrcaCConfig *out, char *err,
-                       size_t err_n) {
-  size_t size;
-  if (in->magic != ORCAC_CONFIG_MAGIC) {
-    orcac_errf(err, err_n,
-               "orcac: config magic 0x%08lx is not ORCAC_CONFIG_MAGIC; fill "
-               "the struct with orcac_config_init",
-               (unsigned long)in->magic);
-    return ORCAC_E_INVALID;
-  }
-  size = in->struct_size;
-  if (size < ORCAC_CONFIG_MIN_SIZE) {
-    orcac_errf(err, err_n,
-               "orcac: config struct_size %lu is below the ABI 1 minimum %lu",
-               (unsigned long)size, (unsigned long)ORCAC_CONFIG_MIN_SIZE);
-    return ORCAC_E_INVALID;
-  }
-  if (in->version == 0) {
-    orcac_errf(err, err_n, "orcac: config version 0 is invalid");
-    return ORCAC_E_INVALID;
-  }
-  if (in->version > ORCAC_CONFIG_VERSION) {
-    orcac_errf(err, err_n,
-               "orcac: config version %lu is newer than this library (%u)",
-               (unsigned long)in->version, ORCAC_CONFIG_VERSION);
-    return ORCAC_E_UNSUPPORTED;
-  }
-  if (size > sizeof(OrcaCConfig)) {
-    const unsigned char *tail =
-        (const unsigned char *)in + sizeof(OrcaCConfig);
-    for (size_t i = 0; i < size - sizeof(OrcaCConfig); ++i) {
-      if (tail[i] != 0) {
-        orcac_errf(err, err_n,
-                   "orcac: config sets fields past the %lu bytes this "
-                   "library knows",
-                   (unsigned long)sizeof(OrcaCConfig));
-        return ORCAC_E_UNSUPPORTED;
+  for (;;) {
+    if (len + 4096 + 1 > cap) {
+      cap *= 2;
+      char *grown = realloc(buf, cap);
+      if (!grown) {
+        free(buf);
+        fclose(f);
+        return NULL;
       }
+      buf = grown;
+    }
+    const size_t got = fread(buf + len, 1, 4096, f);
+    len += got;
+    if (got < 4096)
+      break;
+  }
+  fclose(f);
+  buf[len] = '\0';
+  *length = len;
+  return buf;
+}
+
+/* Last max_bytes of a file, cut at a line start. Never NULL. */
+static char *file_tail(const char *path, size_t max_bytes) {
+  size_t len = 0;
+  char *all = read_file(path, &len);
+  if (!all)
+    return dup_str("(not written)");
+  if (len == 0) {
+    free(all);
+    return dup_str("(empty)");
+  }
+  const char *start = all;
+  if (len > max_bytes) {
+    start = all + (len - max_bytes);
+    const char *nl = strchr(start, '\n');
+    if (nl && nl[1])
+      start = nl + 1;
+  }
+  size_t n = strlen(start);
+  while (n > 0 && (start[n - 1] == '\n' || start[n - 1] == '\r'))
+    --n;
+  char *out = malloc(n + 1);
+  if (out) {
+    memcpy(out, start, n);
+    out[n] = '\0';
+  }
+  free(all);
+  return out ? out : dup_str("(out of memory)");
+}
+
+static int copy_file(const char *from, const char *to) {
+  FILE *in = fopen(from, "rb");
+  if (!in)
+    return -1;
+  FILE *out = fopen(to, "wb");
+  if (!out) {
+    fclose(in);
+    return -1;
+  }
+  char buf[65536];
+  int rc = 0;
+  for (;;) {
+    const size_t got = fread(buf, 1, sizeof(buf), in);
+    if (got && fwrite(buf, 1, got, out) != got) {
+      rc = -1;
+      break;
+    }
+    if (got < sizeof(buf)) {
+      if (ferror(in))
+        rc = -1;
+      break;
     }
   }
-  default_config(out);
-  memcpy(out, in, size < sizeof(*out) ? size : sizeof(*out));
-  out->struct_size = sizeof(*out);
-  for (size_t i = 0; i < sizeof(out->reserved) / sizeof(out->reserved[0]);
-       ++i) {
-    if (out->reserved[i] != 0) {
-      orcac_errf(err, err_n, "orcac: config reserved[%lu] must be zero",
-                 (unsigned long)i);
-      return ORCAC_E_INVALID;
+  fclose(in);
+  if (fclose(out) != 0)
+    rc = -1;
+  return rc;
+}
+
+static int remove_entry(const char *path, const struct stat *sb, int flag,
+                        struct FTW *ftw) {
+  (void)sb;
+  (void)flag;
+  (void)ftw;
+  return remove(path);
+}
+
+static void remove_tree(const char *dir) {
+  if (dir && dir[0])
+    nftw(dir, remove_entry, 16, FTW_DEPTH | FTW_PHYS);
+}
+
+static int mkdir_p(const char *dir) {
+  char path[PATH_MAX];
+  const size_t n = strlen(dir);
+  if (n == 0 || n >= sizeof(path))
+    return -1;
+  memcpy(path, dir, n + 1);
+  for (char *p = path + 1; *p; ++p) {
+    if (*p == '/') {
+      *p = '\0';
+      if (mkdir(path, 0755) != 0 && errno != EEXIST)
+        return -1;
+      *p = '/';
     }
   }
-  return ORCAC_OK;
+  if (mkdir(path, 0755) != 0 && errno != EEXIST)
+    return -1;
+  return is_directory(path) ? 0 : -1;
 }
 
-static const char *default_request(void) {
-  const char *env = getenv("ORCAC_ORCA");
-  return (env != NULL && env[0] != '\0') ? env : "orca";
-}
+/* ---- executable resolution ---- */
 
-static int resolve_exe(const char *requested, char *out, size_t out_n,
-                       char *err, size_t err_n) {
-  const char *name = (requested != NULL && requested[0] != '\0')
-                         ? requested
-                         : default_request();
-  if (orcac_resolve_executable(name, out, out_n, err, err_n) != 0) {
-    return ORCAC_E_NOT_FOUND;
+static int search_path(const char *name, char *out, size_t cap) {
+  const char *path = getenv("PATH");
+  if (!path)
+    return -1;
+  const char *p = path;
+  for (;;) {
+    const char *colon = strchr(p, ':');
+    const size_t n = colon ? (size_t)(colon - p) : strlen(p);
+    if (n > 0) {
+      char cand[PATH_MAX];
+      const int w = snprintf(cand, sizeof(cand), "%.*s/%s", (int)n, p, name);
+      if (w > 0 && (size_t)w < sizeof(cand) && is_executable_file(cand))
+        return absolute_path(cand, out, cap);
+    }
+    if (!colon)
+      return -1;
+    p = colon + 1;
   }
-  return ORCAC_OK;
 }
 
-static void free_settings(OrcacSettings *s) {
-  free(s->method);
-  free(s->basis);
-  free(s->keywords);
-  free(s->blocks);
-  free(s->executable);
-  free(s->scratch_dir);
-  memset(s, 0, sizeof(*s));
+static int resolve_named(const char *spec, const char *source, char *out,
+                         size_t cap) {
+  char cand[PATH_MAX];
+  if (source && is_directory(spec)) {
+    const int w = snprintf(cand, sizeof(cand), "%s/orca", spec);
+    if (w < 0 || (size_t)w >= sizeof(cand))
+      return -1;
+    spec = cand;
+  }
+  if (strchr(spec, '/')) {
+    if (!is_executable_file(spec)) {
+      if (source)
+        orcac_set_error("orcac: %s is set but %s is not an executable file",
+                        source, spec);
+      else
+        orcac_set_error("orcac: ORCA executable %s is not an executable file",
+                        spec);
+      return -1;
+    }
+    if (absolute_path(spec, out, cap) != 0) {
+      orcac_set_error("orcac: executable path too long");
+      return -1;
+    }
+    return 0;
+  }
+  if (search_path(spec, out, cap) != 0) {
+    if (source)
+      orcac_set_error("orcac: %s=%s is not found on PATH", source, spec);
+    else
+      orcac_set_error("orcac: no ORCA executable '%s' on PATH", spec);
+    return -1;
+  }
+  return 0;
 }
 
-/* Validate cfg (NULL is the defaults), resolve its executable, copy it. */
-static int load_settings(const OrcaCConfig *cfg_in, OrcacSettings *out,
-                         char *exe, size_t exe_n, char *err, size_t err_n) {
-  OrcaCConfig copy;
-  const OrcaCConfig *cfg = &copy;
-  OrcacSettings tmp;
-  int st;
-
-  if (cfg_in == NULL) {
-    default_config(&copy);
+int orcac_resolve_executable(const char *requested, char *out,
+                             size_t capacity) {
+  if (!out || capacity == 0) {
+    orcac_set_error("orcac_resolve_executable: no output buffer");
+    return -1;
+  }
+  char resolved[PATH_MAX];
+  int rc;
+  if (requested && requested[0]) {
+    rc = resolve_named(requested, NULL, resolved, sizeof(resolved));
   } else {
-    st = read_config(cfg_in, &copy, err, err_n);
-    if (st != ORCAC_OK) {
-      return st;
+    static const char *const vars[] = {"RGPOT_ORCA", "ORCA", "ORCA_EXE"};
+    rc = 1;
+    for (size_t i = 0; i < sizeof(vars) / sizeof(vars[0]); ++i) {
+      const char *v = getenv(vars[i]);
+      if (v && v[0]) {
+        rc = resolve_named(v, vars[i], resolved, sizeof(resolved));
+        break;
+      }
+    }
+    if (rc == 1) {
+      rc = search_path("orca", resolved, sizeof(resolved));
+      if (rc != 0)
+        orcac_set_error(
+            "orcac: no ORCA executable found; set ORCAParams.executable, "
+            "RGPOT_ORCA, ORCA or ORCA_EXE, or put orca on PATH");
     }
   }
-  if (cfg->multiplicity < 1) {
-    orcac_errf(err, err_n, "orcac: multiplicity %d must be >= 1",
-               cfg->multiplicity);
-    return ORCAC_E_INVALID;
+  if (rc != 0)
+    return -1;
+  if (strlen(resolved) + 1 > capacity) {
+    orcac_set_error("orcac_resolve_executable: buffer too small");
+    return -1;
   }
-  if (cfg->nprocs < 1) {
-    orcac_errf(err, err_n, "orcac: nprocs %d must be >= 1", cfg->nprocs);
-    return ORCAC_E_INVALID;
-  }
-  if (cfg->maxcore_mb < 0) {
-    orcac_errf(err, err_n, "orcac: maxcore_mb %d must be >= 0",
-               cfg->maxcore_mb);
-    return ORCAC_E_INVALID;
-  }
-  if (!isfinite(cfg->timeout_s) || cfg->timeout_s < 0.0) {
-    orcac_errf(err, err_n, "orcac: timeout_s must be finite and >= 0");
-    return ORCAC_E_INVALID;
-  }
-  if (cfg->guess_policy != ORCAC_GUESS_FRESH &&
-      cfg->guess_policy != ORCAC_GUESS_CHAIN) {
-    orcac_errf(err, err_n, "orcac: unknown guess_policy %d",
-               cfg->guess_policy);
-    return ORCAC_E_INVALID;
-  }
-  if ((cfg->flags & ~(uint32_t)ORCAC_FLAGS_KNOWN) != 0) {
-    orcac_errf(err, err_n, "orcac: unknown flag bits 0x%08lx",
-               (unsigned long)(cfg->flags & ~(uint32_t)ORCAC_FLAGS_KNOWN));
-    return ORCAC_E_INVALID;
-  }
-  if ((cfg->flags & ORCAC_F_ALLOW_NEAR_CONVERGED) != 0) {
-    orcac_errf(err, err_n,
-               "orcac: ORCAC_F_ALLOW_NEAR_CONVERGED is reserved; unconverged "
-               "SCF results are always rejected");
-    return ORCAC_E_UNSUPPORTED;
-  }
-  if (orcac_validate_token("method", cfg->method, err, err_n) != 0 ||
-      orcac_validate_token("basis", cfg->basis, err, err_n) != 0 ||
-      orcac_validate_keywords(cfg->keywords, err, err_n) != 0 ||
-      orcac_validate_blocks(cfg->blocks, err, err_n) != 0) {
-    return ORCAC_E_INVALID;
-  }
-  st = resolve_exe(cfg->executable, exe, exe_n, err, err_n);
-  if (st != ORCAC_OK) {
-    return st;
-  }
-
-  memset(&tmp, 0, sizeof(tmp));
-  tmp.method = dup_string(cfg->method != NULL ? cfg->method : "HF");
-  tmp.basis = dup_string(cfg->basis != NULL ? cfg->basis : "STO-3G");
-  tmp.keywords = dup_string(cfg->keywords);
-  tmp.blocks = dup_string(cfg->blocks);
-  tmp.executable = dup_string(cfg->executable);
-  tmp.scratch_dir = dup_string(cfg->scratch_dir);
-  tmp.charge = cfg->charge;
-  tmp.multiplicity = cfg->multiplicity;
-  tmp.nprocs = cfg->nprocs;
-  tmp.maxcore_mb = cfg->maxcore_mb;
-  tmp.timeout_s = cfg->timeout_s;
-  tmp.guess_policy = cfg->guess_policy;
-  tmp.flags = cfg->flags;
-  if (tmp.method == NULL || tmp.basis == NULL || tmp.keywords == NULL ||
-      tmp.blocks == NULL || tmp.executable == NULL ||
-      tmp.scratch_dir == NULL) {
-    free_settings(&tmp);
-    orcac_errf(err, err_n, "orcac: out of memory while copying config");
-    return ORCAC_E_ERROR;
-  }
-  *out = tmp;
-  return ORCAC_OK;
+  memcpy(out, resolved, strlen(resolved) + 1);
+  return 0;
 }
 
-int orcac_config_init(OrcaCConfig *config, size_t struct_size) {
-  OrcaCConfig defaults;
-  if (config == NULL) {
-    return finish(NULL, NULL, ORCAC_E_INVALID, "orcac: config is NULL");
+/* ---- session lifetime ---- */
+
+static void session_error(OrcaCSession *s, const char *text) {
+  if (!s)
+    return;
+  char *copy = dup_str(text ? text : "");
+  if (copy) {
+    free(s->error);
+    s->error = copy;
   }
-  if (struct_size < ORCAC_CONFIG_MIN_SIZE) {
-    char msg[128];
-    snprintf(msg, sizeof(msg),
-             "orcac: struct_size %lu is below the ABI 1 minimum %lu",
-             (unsigned long)struct_size,
-             (unsigned long)ORCAC_CONFIG_MIN_SIZE);
-    return finish(NULL, NULL, ORCAC_E_INVALID, msg);
-  }
-  default_config(&defaults);
-  defaults.struct_size = struct_size;
-  memset(config, 0, struct_size);
-  memcpy(config, &defaults,
-         struct_size < sizeof(defaults) ? struct_size : sizeof(defaults));
-  return finish(NULL, NULL, ORCAC_OK, "");
 }
 
-int orcac_create(const OrcaCConfig *config, OrcaCSession **out, char *errbuf,
-                 size_t errbuf_size) {
-  char err[ORCAC_LAST_ERROR_SIZE];
-  char exe[PATH_MAX];
-  char run_dir[PATH_MAX];
-  OrcaCSession *s = NULL;
-  int st;
-
-  err[0] = '\0';
-  if (out == NULL) {
-    orcac_errf(err, sizeof(err), "orcac: out is NULL");
-    st = ORCAC_E_INVALID;
-    goto report;
-  }
-  *out = NULL;
-  s = (OrcaCSession *)calloc(1, sizeof(*s));
-  if (s == NULL) {
-    orcac_errf(err, sizeof(err), "orcac: out of memory for session");
-    st = ORCAC_E_ERROR;
-    goto report;
-  }
-  st = load_settings(config, &s->settings, exe, sizeof(exe), err,
-                     sizeof(err));
-  if (st != ORCAC_OK) {
-    goto report;
-  }
-  st = ORCAC_E_ERROR;
-  s->exe = dup_string(exe);
-  if (s->exe == NULL) {
-    orcac_errf(err, sizeof(err), "orcac: out of memory for executable path");
-    goto report;
-  }
-  if (orcac_make_run_dir(s->settings.scratch_dir, run_dir, sizeof(run_dir),
-                         err, sizeof(err)) != 0) {
-    goto report;
-  }
-  s->run_dir = dup_string(run_dir);
-  if (s->run_dir == NULL) {
-    orcac_remove_tree(run_dir);
-    orcac_errf(err, sizeof(err), "orcac: out of memory for scratch path");
-    goto report;
-  }
-  if (pthread_mutex_init(&s->lock, NULL) != 0) {
-    orcac_errf(err, sizeof(err), "orcac: could not initialise session lock");
-    goto report;
-  }
-  atomic_init(&s->cancel_gen, 0u);
-  orcac_cache_init(&s->guesses);
-  s->owner_pid = getpid();
-  *out = s;
-  copy_text(errbuf, errbuf_size, "");
-  return finish(s, NULL, ORCAC_OK, "");
-
-report:
-  if (s != NULL) {
-    if (s->run_dir != NULL) {
-      orcac_remove_tree(s->run_dir);
-    }
-    free_settings(&s->settings);
-    free(s->exe);
-    free(s->run_dir);
-    free(s);
-  }
-  copy_text(errbuf, errbuf_size, err);
-  return finish(NULL, NULL, st, err);
-}
-
-int orcac_configure(OrcaCSession *s, const OrcaCConfig *config) {
-  OrcacSettings next;
-  char exe[PATH_MAX];
-  char *exe_copy;
-  int st;
-
-  if (s == NULL) {
-    return finish(NULL, NULL, ORCAC_E_INVALID, "orcac: session is NULL");
-  }
-  if (getpid() != s->owner_pid) {
-    return reject_foreign(s, NULL);
-  }
-  if (pthread_mutex_trylock(&s->lock) != 0) {
-    return finish(NULL, NULL, ORCAC_E_BUSY,
-                  "orcac: another call is running on this session");
-  }
-  st = load_settings(config, &next, exe, sizeof(exe), s->last_error,
-                     sizeof(s->last_error));
-  if (st != ORCAC_OK) {
-    goto done;
-  }
-  exe_copy = dup_string(exe);
-  if (exe_copy == NULL) {
-    free_settings(&next);
-    orcac_errf(s->last_error, sizeof(s->last_error),
-               "orcac: out of memory for executable path");
-    st = ORCAC_E_ERROR;
-    goto done;
-  }
-  if (strcmp(next.scratch_dir, s->settings.scratch_dir) != 0) {
-    char run_dir[PATH_MAX];
-    char *run_copy;
-    if (orcac_make_run_dir(next.scratch_dir, run_dir, sizeof(run_dir),
-                           s->last_error, sizeof(s->last_error)) != 0) {
-      free_settings(&next);
-      free(exe_copy);
-      st = ORCAC_E_ERROR;
-      goto done;
-    }
-    run_copy = dup_string(run_dir);
-    if (run_copy == NULL) {
-      orcac_remove_tree(run_dir);
-      free_settings(&next);
-      free(exe_copy);
-      orcac_errf(s->last_error, sizeof(s->last_error),
-                 "orcac: out of memory for scratch path");
-      st = ORCAC_E_ERROR;
-      goto done;
-    }
-    orcac_cache_clear(&s->guesses, s->run_dir);
-    orcac_remove_tree(s->run_dir);
-    free(s->run_dir);
-    s->run_dir = run_copy;
-  } else if (next.charge != s->settings.charge ||
-             next.multiplicity != s->settings.multiplicity ||
-             next.guess_policy == ORCAC_GUESS_FRESH) {
-    orcac_cache_clear(&s->guesses, s->run_dir);
-  }
-  free_settings(&s->settings);
-  s->settings = next;
-  free(s->exe);
-  s->exe = exe_copy;
-  st = ORCAC_OK;
-
-done:
-  finish(s, NULL, st, s->last_error);
-  pthread_mutex_unlock(&s->lock);
-  return st;
-}
-
-static void append_tails(OrcaCSession *s, const RunPaths *p) {
-  char *stderr_tail = orcac_file_tail(p->err, ORCAC_TAIL_BYTES);
-  char *stdout_tail = orcac_file_tail(p->out, ORCAC_TAIL_BYTES);
-  char head[ORCAC_LAST_ERROR_SIZE];
-  copy_text(head, sizeof(head), s->last_error);
-  orcac_errf(s->last_error, sizeof(s->last_error),
-             "%s\nstderr tail:\n%s\nstdout tail:\n%s", head,
-             stderr_tail != NULL ? stderr_tail : "(none)",
-             stdout_tail != NULL ? stdout_tail : "(none)");
-  free(stderr_tail);
-  free(stdout_tail);
-}
-
-/*
- * One ORCA run. Leaves the error text in s->last_error and fills parsed
- * on ORCAC_OK. info counts runs and records the last exit.
- */
-static int run_once(OrcaCSession *s, const RunPaths *p, int n_atoms,
-                    const double *positions_ang, const int *atomic_numbers,
-                    const char *moinp_name, OrcacEngrad *parsed,
-                    OrcaCResult *info) {
-  char *err = s->last_error;
-  size_t err_n = sizeof(s->last_error);
-  char *input_text = NULL;
-  char *engrad_text = NULL;
-  char *stdout_text = NULL;
-  char **envp = NULL;
-  OrcacDeck deck;
-  OrcacRunOptions options;
-  OrcacChildResult child;
-  int st = ORCAC_E_ERROR;
-  int started = 0;
-
-  err[0] = '\0';
-  memset(parsed, 0, sizeof(*parsed));
-  if (atomic_load(&s->cancel_gen) != s->cancel_seen) {
-    orcac_errf(err, err_n, "orcac: cancelled before ORCA started");
-    return ORCAC_E_CANCELLED;
-  }
-  if (safe_unlink(p->engrad) != 0 || safe_unlink(p->gbw) != 0) {
-    orcac_errf(err, err_n, "orcac: could not clear stale ORCA outputs");
-    return ORCAC_E_ERROR;
-  }
-
-  deck.method = s->settings.method;
-  deck.basis = s->settings.basis;
-  deck.keywords = s->settings.keywords;
-  deck.blocks = s->settings.blocks;
-  deck.charge = s->settings.charge;
-  deck.multiplicity = s->settings.multiplicity;
-  deck.nprocs = s->settings.nprocs;
-  deck.maxcore_mb = s->settings.maxcore_mb;
-  if (orcac_render_input(&deck, n_atoms, positions_ang, atomic_numbers,
-                         moinp_name, &input_text, err, err_n) != 0) {
-    goto out;
-  }
-  if (write_text_file(p->inp, input_text, err, err_n) != 0) {
-    goto out;
-  }
-  if ((s->settings.flags & ORCAC_F_KEEP_MPI_ENV) == 0) {
-    envp = orcac_child_env(0);
-    if (envp == NULL) {
-      orcac_errf(err, err_n, "orcac: out of memory for child environment");
-      goto out;
-    }
-  }
-  options.timeout_s = s->settings.timeout_s;
-  options.envp = envp;
-  options.cancel_gen = &s->cancel_gen;
-  options.cancel_seen = s->cancel_seen;
-  if (orcac_run_orca(s->exe, s->run_dir, "orcac.inp", p->out, p->err,
-                     &options, &child, err, err_n) != 0) {
-    goto out;
-  }
-  started = 1;
-  info->orca_runs += 1;
-  info->exit_code = child.exited ? child.exit_code : -1;
-  info->term_signal = child.signal;
-
-  if (child.cancelled) {
-    orcac_errf(err, err_n, "orcac: ORCA run cancelled");
-    st = ORCAC_E_CANCELLED;
-    goto out;
-  }
-  if (child.timed_out) {
-    orcac_errf(err, err_n, "orcac: ORCA timed out after %g s",
-               s->settings.timeout_s);
-    st = ORCAC_E_TIMEOUT;
-    goto out;
-  }
-  if (orcac_read_file(p->out, &stdout_text) != 0) {
-    stdout_text = NULL;
-  }
-  if (orcac_scf_not_converged(stdout_text)) {
-    orcac_errf(err, err_n, "orcac: ORCA SCF did not converge (exit status %d)",
-               info->exit_code);
-    st = ORCAC_E_NOT_CONVERGED;
-    goto out;
-  }
-  if (child.reaped_elsewhere) {
-    if (!orcac_terminated_normally(stdout_text)) {
-      orcac_errf(err, err_n,
-                 "orcac: ORCA was reaped by another waiter in this process "
-                 "(SIGCHLD ignored or waited for elsewhere); its exit status "
-                 "is lost and its output does not show normal termination");
-      goto out;
-    }
-  } else if (!child.exited || child.exit_code != 0) {
-    if (child.signal != 0) {
-      orcac_errf(err, err_n, "orcac: ORCA terminated by signal %d",
-                 child.signal);
-    } else {
-      orcac_errf(err, err_n, "orcac: ORCA exited with status %d",
-                 child.exit_code);
-    }
-    goto out;
-  }
-  if (!orcac_terminated_normally(stdout_text)) {
-    orcac_errf(err, err_n,
-               "orcac: ORCA exited 0 but its output lacks the normal "
-               "termination banner");
-    goto out;
-  }
-  if (orcac_read_file(p->engrad, &engrad_text) != 0) {
-    orcac_errf(err, err_n, "orcac: ORCA finished without writing orcac.engrad");
-    goto out;
-  }
-  if (orcac_parse_engrad(engrad_text, n_atoms, parsed, err, err_n) != 0) {
-    goto out;
-  }
-  for (int i = 0; i < n_atoms; ++i) {
-    if (parsed->atomic_numbers[i] != atomic_numbers[i]) {
-      orcac_errf(err, err_n, "orcac: engrad atomic numbers differ from the input");
-      goto out;
-    }
-  }
-  if (!isfinite(parsed->energy_h)) {
-    orcac_errf(err, err_n, "orcac: engrad contains non-finite energy");
-    goto out;
-  }
-  for (int i = 0; i < n_atoms * 3; ++i) {
-    if (!isfinite(parsed->gradient_h_bohr[i])) {
-      orcac_errf(err, err_n, "orcac: engrad contains non-finite gradients");
-      goto out;
-    }
-  }
-  st = ORCAC_OK;
-
-out:
-  if (st != ORCAC_OK) {
-    orcac_free_engrad(parsed);
-    if (started && st != ORCAC_E_CANCELLED) {
-      append_tails(s, p);
-    }
-  }
-  orcac_free_child_env(envp);
-  free(input_text);
-  free(engrad_text);
-  free(stdout_text);
-  return st;
-}
-
-static int check_call(int n_atoms, const double *positions_ang,
-                      const int *atomic_numbers, uint32_t want,
-                      const double *energy_h, const double *gradient_h_bohr,
-                      char *err, size_t err_n) {
-  if ((want & ~(uint32_t)ORCAC_WANT_KNOWN) != 0) {
-    orcac_errf(err, err_n, "orcac: unknown want bits 0x%08lx",
-               (unsigned long)(want & ~(uint32_t)ORCAC_WANT_KNOWN));
-    return ORCAC_E_INVALID;
-  }
-  if ((want & ORCAC_WANT_STRESS) != 0) {
-    orcac_errf(err, err_n,
-               "orcac: stress is not available from cluster EnGrad runs");
-    return ORCAC_E_UNSUPPORTED;
-  }
-  if (want == 0) {
-    orcac_errf(err, err_n, "orcac: want selects nothing");
-    return ORCAC_E_INVALID;
-  }
-  if (((want & ORCAC_WANT_ENERGY) != 0 && energy_h == NULL) ||
-      ((want & ORCAC_WANT_GRADIENT) != 0 && gradient_h_bohr == NULL)) {
-    orcac_errf(err, err_n, "orcac: missing output buffer for want 0x%lx",
-               (unsigned long)want);
-    return ORCAC_E_INVALID;
-  }
-  if (n_atoms <= 0 || n_atoms > ORCAC_MAX_ATOMS || positions_ang == NULL ||
-      atomic_numbers == NULL) {
-    orcac_errf(err, err_n, "orcac: invalid atoms (n_atoms %d)", n_atoms);
-    return ORCAC_E_INVALID;
-  }
-  for (int i = 0; i < n_atoms; ++i) {
-    if (orcac_element_symbol(atomic_numbers[i]) == NULL) {
-      orcac_errf(err, err_n, "orcac: atom %d has atomic number %d", i,
-                 atomic_numbers[i]);
-      return ORCAC_E_INVALID;
-    }
-  }
-  for (int i = 0; i < 3 * n_atoms; ++i) {
-    if (!isfinite(positions_ang[i])) {
-      orcac_errf(err, err_n, "orcac: position %d is not finite", i);
-      return ORCAC_E_INVALID;
-    }
-  }
-  return ORCAC_OK;
-}
-
-/*
- * Everything that changes the orbitals a stored guess holds. Each field
- * is length-prefixed so no value can imitate a field boundary.
- */
-static char *guess_key(const OrcaCSession *s) {
-  const char *fields[5];
-  size_t n = 64;
-  char *key;
-  size_t used = 0;
-  fields[0] = s->settings.method;
-  fields[1] = s->settings.basis;
-  fields[2] = s->settings.keywords;
-  fields[3] = s->settings.blocks;
-  fields[4] = s->exe;
-  for (int i = 0; i < 5; ++i) {
-    n += strlen(fields[i]) + 24u;
-  }
-  key = (char *)malloc(n);
-  if (key == NULL) {
+static char *make_run_dir(const orcac_config *cfg, char *err, size_t errlen) {
+  const char *parent = cfg->scratch_dir;
+  if (!parent || !parent[0])
+    parent = getenv("TMPDIR");
+  if (!parent || !parent[0])
+    parent = "/tmp";
+  char abs_parent[PATH_MAX];
+  if (absolute_path(parent, abs_parent, sizeof(abs_parent)) != 0 ||
+      mkdir_p(abs_parent) != 0) {
+    snprintf(err, errlen, "orcac: scratch directory %s: %s", parent,
+             strerror(errno));
     return NULL;
   }
-  for (int i = 0; i < 5; ++i) {
-    used += (size_t)snprintf(key + used, n - used, "%lu:%s;",
-                             (unsigned long)strlen(fields[i]), fields[i]);
+  char *pattern = join_path(abs_parent, "orcac-XXXXXX");
+  if (!pattern) {
+    snprintf(err, errlen, "orcac: out of memory");
+    return NULL;
   }
-  snprintf(key + used, n - used, "q%d;m%d", s->settings.charge,
-           s->settings.multiplicity);
-  return key;
+  if (!mkdtemp(pattern)) {
+    snprintf(err, errlen, "orcac: could not create a directory under %s: %s",
+             abs_parent, strerror(errno));
+    free(pattern);
+    return NULL;
+  }
+  return pattern;
 }
 
-#ifdef ORCAC_TEST_HOOKS
-void (*orcac_test_after_lock)(OrcaCSession *session) = NULL;
-#endif
-
-static int evaluate(OrcaCSession *s, int n_atoms, const double *positions_ang,
-                    const int *atomic_numbers, uint32_t want,
-                    double *energy_h, double *gradient_h_bohr,
-                    OrcaCResult *meta) {
-  double t0 = now_s();
-  OrcaCResult info;
-  RunPaths paths;
-  OrcacEngrad parsed;
-  char guess_name[ORCAC_GUESS_NAME_SIZE];
-  char *key = NULL;
-  unsigned int seen;
-  int slot = -1;
-  int st;
-
-  if (s == NULL) {
-    return finish(NULL, meta, ORCAC_E_INVALID, "orcac: session is NULL");
-  }
-  if (getpid() != s->owner_pid) {
-    return reject_foreign(s, meta);
-  }
-  /*
-   * Read before the lock: a cancel from here on stops this call, and no
-   * store by this call can erase it.
-   */
-  seen = atomic_load(&s->cancel_gen);
-  if (pthread_mutex_trylock(&s->lock) != 0) {
-    return finish(NULL, meta, ORCAC_E_BUSY,
-                  "orcac: another call is running on this session");
-  }
-#ifdef ORCAC_TEST_HOOKS
-  if (orcac_test_after_lock != NULL) {
-    orcac_test_after_lock(s);
-  }
-#endif
-  s->cancel_seen = seen;
-
-  memset(&info, 0, sizeof(info));
-  memset(&paths, 0, sizeof(paths));
-  memset(&parsed, 0, sizeof(parsed));
-  info.exit_code = -1;
-
-  st = check_call(n_atoms, positions_ang, atomic_numbers, want, energy_h,
-                  gradient_h_bohr, s->last_error, sizeof(s->last_error));
-  if (st != ORCAC_OK) {
-    goto done;
-  }
-
-  paths.inp = join_path2(s->run_dir, "orcac.inp");
-  paths.out = join_path2(s->run_dir, "orcac.out");
-  paths.err = join_path2(s->run_dir, "orcac.err");
-  paths.engrad = join_path2(s->run_dir, "orcac.engrad");
-  paths.gbw = join_path2(s->run_dir, "orcac.gbw");
-  if (paths.inp == NULL || paths.out == NULL || paths.err == NULL ||
-      paths.engrad == NULL || paths.gbw == NULL) {
-    orcac_errf(s->last_error, sizeof(s->last_error),
-               "orcac: out of memory for run file paths");
-    st = ORCAC_E_ERROR;
-    goto done;
-  }
-
-  if (s->settings.guess_policy == ORCAC_GUESS_CHAIN) {
-    key = guess_key(s);
-    if (key == NULL) {
-      orcac_errf(s->last_error, sizeof(s->last_error),
-                 "orcac: out of memory for guess key");
-      st = ORCAC_E_ERROR;
-      goto done;
+static void drop_guess(OrcaCSession *s) {
+  if (s->run_dir) {
+    char *guess = join_path(s->run_dir, k_guess);
+    if (guess) {
+      remove(guess);
+      free(guess);
     }
-    slot = orcac_cache_lookup(&s->guesses, s->run_dir, key, n_atoms,
-                              atomic_numbers);
   }
-  if (slot >= 0) {
-    orcac_cache_slot_name(slot, guess_name);
+  s->has_guess = 0;
+  free(s->guess_numbers);
+  s->guess_numbers = NULL;
+  s->guess_n = 0;
+}
+
+/* Takes ownership of cfg on success and on failure. */
+static OrcaCSession *session_from_config(orcac_config *cfg) {
+  char err[1024] = "";
+  if (orcac_config_validate(cfg, err, sizeof(err)) != 0) {
+    orcac_set_error("%s", err);
+    orcac_config_free(cfg);
+    return NULL;
   }
-  st = run_once(s, &paths, n_atoms, positions_ang, atomic_numbers,
-                slot >= 0 ? guess_name : NULL, &parsed, &info);
-  info.used_guess = slot >= 0;
-  if (st != ORCAC_OK && slot >= 0) {
-    orcac_cache_drop(&s->guesses, s->run_dir, slot);
-    if ((st == ORCAC_E_ERROR || st == ORCAC_E_NOT_CONVERGED) &&
-        (s->settings.flags & ORCAC_F_NO_FRESH_RETRY) == 0) {
-      info.retried_fresh = 1;
-      info.used_guess = 0;
-      st = run_once(s, &paths, n_atoms, positions_ang, atomic_numbers, NULL,
-                    &parsed, &info);
-      if (st != ORCAC_OK) {
-        char head[ORCAC_LAST_ERROR_SIZE];
-        copy_text(head, sizeof(head), s->last_error);
-        orcac_errf(s->last_error, sizeof(s->last_error),
-                   "orcac: fresh retry after a failed MORead run: %s", head);
+  char exe[PATH_MAX];
+  if (orcac_resolve_executable(cfg->executable, exe, sizeof(exe)) != 0) {
+    orcac_config_free(cfg);
+    return NULL;
+  }
+  OrcaCSession *s = calloc(1, sizeof(*s));
+  if (!s) {
+    orcac_set_error("orcac: out of memory");
+    orcac_config_free(cfg);
+    return NULL;
+  }
+  s->cfg = *cfg;
+  s->exe = dup_str(exe);
+  s->run_dir = make_run_dir(&s->cfg, err, sizeof(err));
+  s->error = dup_str("");
+  if (!s->exe || !s->run_dir || !s->error) {
+    orcac_set_error("%s", err[0] ? err : "orcac: out of memory");
+    orcac_session_destroy(s);
+    return NULL;
+  }
+  orcac_set_error("%s", "");
+  return s;
+}
+
+OrcaCSession *orcac_session_create(const void *params_capnp,
+                                   size_t params_capnp_size_bytes) {
+  char err[1024] = "";
+  orcac_config cfg;
+  if (orcac_decode_params(params_capnp, params_capnp_size_bytes, &cfg, err,
+                          sizeof(err)) != 0) {
+    orcac_set_error("%s", err);
+    return NULL;
+  }
+  return session_from_config(&cfg);
+}
+
+OrcaCSession *orcac_session_create_from_config(const void *config_capnp,
+                                               size_t config_capnp_size_bytes) {
+  char err[1024] = "";
+  orcac_config cfg;
+  if (orcac_decode_potential_config(config_capnp, config_capnp_size_bytes,
+                                    &cfg, err, sizeof(err)) != 0) {
+    orcac_set_error("%s", err);
+    return NULL;
+  }
+  return session_from_config(&cfg);
+}
+
+OrcaCSession *orcac_session_create_from_spec(const void *spec_capnp,
+                                             size_t spec_capnp_size_bytes) {
+  char err[1024] = "";
+  orcac_config cfg;
+  if (orcac_decode_potential_spec(spec_capnp, spec_capnp_size_bytes, &cfg,
+                                  err, sizeof(err)) != 0) {
+    orcac_set_error("%s", err);
+    return NULL;
+  }
+  return session_from_config(&cfg);
+}
+
+void orcac_session_destroy(OrcaCSession *session) {
+  if (!session)
+    return;
+  if (session->run_dir && !session->cfg.keep_files)
+    remove_tree(session->run_dir);
+  free(session->run_dir);
+  free(session->exe);
+  free(session->guess_numbers);
+  free(session->error);
+  orcac_config_free(&session->cfg);
+  free(session);
+}
+
+/* Takes ownership of cfg. */
+static int session_apply(OrcaCSession *s, orcac_config *cfg) {
+  char err[1024] = "";
+  if (orcac_config_validate(cfg, err, sizeof(err)) != 0) {
+    orcac_set_error("%s", err);
+    session_error(s, err);
+    orcac_config_free(cfg);
+    return -1;
+  }
+  char exe[PATH_MAX];
+  if (orcac_resolve_executable(cfg->executable, exe, sizeof(exe)) != 0) {
+    session_error(s, orcac_last_error());
+    orcac_config_free(cfg);
+    return -1;
+  }
+  char *new_exe = dup_str(exe);
+  if (!new_exe) {
+    orcac_set_error("orcac: out of memory");
+    orcac_config_free(cfg);
+    return -1;
+  }
+  char *new_dir = NULL;
+  if (strcmp(cfg->scratch_dir, s->cfg.scratch_dir) != 0) {
+    new_dir = make_run_dir(cfg, err, sizeof(err));
+    if (!new_dir) {
+      orcac_set_error("%s", err);
+      session_error(s, err);
+      free(new_exe);
+      orcac_config_free(cfg);
+      return -1;
+    }
+  }
+  const int keep_guess = !new_dir && cfg->restart &&
+                         orcac_config_same_wavefunction(&s->cfg, cfg) &&
+                         strcmp(exe, s->exe) == 0;
+  if (!keep_guess)
+    drop_guess(s);
+  if (new_dir) {
+    if (!s->cfg.keep_files)
+      remove_tree(s->run_dir);
+    free(s->run_dir);
+    s->run_dir = new_dir;
+  }
+  free(s->exe);
+  s->exe = new_exe;
+  orcac_config_free(&s->cfg);
+  s->cfg = *cfg;
+  orcac_set_error("%s", "");
+  session_error(s, "");
+  return 0;
+}
+
+int orcac_session_set_params(OrcaCSession *session, const void *params_capnp,
+                             size_t params_capnp_size_bytes) {
+  if (!session) {
+    orcac_set_error("orcac_session_set_params: null session");
+    return -1;
+  }
+  char err[1024] = "";
+  orcac_config cfg;
+  if (orcac_decode_params(params_capnp, params_capnp_size_bytes, &cfg, err,
+                          sizeof(err)) != 0) {
+    orcac_set_error("%s", err);
+    session_error(session, err);
+    return -1;
+  }
+  return session_apply(session, &cfg);
+}
+
+int orcac_session_configure(OrcaCSession *session, const void *config_capnp,
+                            size_t config_capnp_size_bytes) {
+  if (!session) {
+    orcac_set_error("orcac_session_configure: null session");
+    return -1;
+  }
+  char err[1024] = "";
+  orcac_config cfg;
+  if (orcac_decode_potential_config(config_capnp, config_capnp_size_bytes,
+                                    &cfg, err, sizeof(err)) != 0) {
+    orcac_set_error("%s", err);
+    session_error(session, err);
+    return -1;
+  }
+  return session_apply(session, &cfg);
+}
+
+int orcac_session_reset(OrcaCSession *session) {
+  if (!session) {
+    orcac_set_error("orcac_session_reset: null session");
+    return -1;
+  }
+  drop_guess(session);
+  session->last_reused = 0;
+  return 0;
+}
+
+int orcac_session_set_charge_multiplicity(OrcaCSession *session, int charge,
+                                          int multiplicity) {
+  if (!session) {
+    orcac_set_error("orcac_session_set_charge_multiplicity: null session");
+    return -1;
+  }
+  if (multiplicity < 1) {
+    orcac_set_error("orcac: multiplicity must be at least 1, got %d",
+                    multiplicity);
+    session_error(session, orcac_last_error());
+    return -1;
+  }
+  if (charge != session->cfg.charge ||
+      multiplicity != session->cfg.multiplicity) {
+    session->cfg.charge = charge;
+    session->cfg.multiplicity = multiplicity;
+    drop_guess(session);
+  }
+  return 0;
+}
+
+int orcac_session_reused_orbitals(const OrcaCSession *session) {
+  return session ? session->last_reused : 0;
+}
+
+const char *orcac_session_last_error(const OrcaCSession *session) {
+  if (!session)
+    return "orcac: null session";
+  return session->error ? session->error : "";
+}
+
+const char *orcac_session_run_directory(const OrcaCSession *session) {
+  return session && session->run_dir ? session->run_dir : "";
+}
+
+const char *orcac_session_executable(const OrcaCSession *session) {
+  return session && session->exe ? session->exe : "";
+}
+
+/* ---- evaluation ---- */
+
+typedef struct run_paths {
+  char *inp, *out, *err, *engrad, *gbw, *guess;
+} run_paths;
+
+static void free_paths(run_paths *p) {
+  free(p->inp);
+  free(p->out);
+  free(p->err);
+  free(p->engrad);
+  free(p->gbw);
+  free(p->guess);
+}
+
+/* Records a failure on the session with the input path and output tails. */
+static void fail_run(OrcaCSession *s, const run_paths *p, const char *what) {
+  char *err_tail = file_tail(p->err, ORCAC_TAIL_BYTES);
+  char *out_tail = file_tail(p->out, ORCAC_TAIL_BYTES);
+  const char *fmt =
+      "orcac: %s\n  input: %s\n  stderr tail:\n%s\n  output tail:\n%s";
+  const int n = snprintf(NULL, 0, fmt, what, p->inp, err_tail, out_tail);
+  char *text = n >= 0 ? malloc((size_t)n + 1) : NULL;
+  if (text) {
+    snprintf(text, (size_t)n + 1, fmt, what, p->inp, err_tail, out_tail);
+    free(s->error);
+    s->error = text;
+  } else {
+    session_error(s, what);
+  }
+  orcac_set_error("%s", s->error);
+  free(err_tail);
+  free(out_tail);
+}
+
+static int remove_stale(OrcaCSession *s, const run_paths *p, const char *path) {
+  if (remove(path) != 0 && errno != ENOENT) {
+    char what[PATH_MAX + 128];
+    snprintf(what, sizeof(what), "could not remove stale %s: %s", path,
+             strerror(errno));
+    fail_run(s, p, what);
+    return -1;
+  }
+  return 0;
+}
+
+enum attempt_result { ATTEMPT_OK = 0, ATTEMPT_RETRYABLE = 1, ATTEMPT_FATAL = 2 };
+
+static int attempt(OrcaCSession *s, const run_paths *p, int n_atoms,
+                   const double *pos, const int *z, int use_guess,
+                   double *energy, double *grad) {
+  char err[1024] = "";
+  char *text = orcac_render(&s->cfg, n_atoms, pos, z,
+                            use_guess ? k_guess : NULL, err, sizeof(err));
+  if (!text) {
+    session_error(s, err);
+    orcac_set_error("%s", err);
+    return ATTEMPT_FATAL;
+  }
+  if (remove_stale(s, p, p->engrad) || remove_stale(s, p, p->gbw)) {
+    free(text);
+    return ATTEMPT_FATAL;
+  }
+  FILE *f = fopen(p->inp, "wb");
+  const size_t len = strlen(text);
+  const int wrote = f && fwrite(text, 1, len, f) == len;
+  const int closed = f ? fclose(f) == 0 : 0;
+  free(text);
+  if (!wrote || !closed) {
+    char what[PATH_MAX + 64];
+    snprintf(what, sizeof(what), "could not write %s", p->inp);
+    session_error(s, what);
+    orcac_set_error("orcac: %s", what);
+    return ATTEMPT_FATAL;
+  }
+
+  char input_name[64];
+  snprintf(input_name, sizeof(input_name), "%s.inp", k_base);
+  orcac_child_status child;
+  orcac_run_child(s->exe, input_name, s->run_dir, p->out, p->err,
+                  s->cfg.timeout_s, &child);
+  if (child.problem[0]) {
+    fail_run(s, p, child.problem);
+    return (child.timed_out || !child.started) ? ATTEMPT_FATAL
+                                               : ATTEMPT_RETRYABLE;
+  }
+
+  size_t out_len = 0;
+  char *out_text = read_file(p->out, &out_len);
+  const int scf_bad = out_text && orcac_scf_failed(out_text, out_len);
+  free(out_text);
+  if (!child.exited) {
+    char what[128];
+    snprintf(what, sizeof(what), "orca was killed by signal %d%s",
+             child.signal, scf_bad ? " after an unconverged SCF" : "");
+    fail_run(s, p, what);
+    return ATTEMPT_RETRYABLE;
+  }
+  if (scf_bad) {
+    char what[128];
+    snprintf(what, sizeof(what), "ORCA SCF did not converge (exit status %d)",
+             child.exit_code);
+    fail_run(s, p, what);
+    return ATTEMPT_RETRYABLE;
+  }
+  if (child.exit_code != 0) {
+    char what[128];
+    snprintf(what, sizeof(what), "orca exited with status %d%s",
+             child.exit_code,
+             child.exit_code == 127 ? " (the executable could not be run)"
+                                    : "");
+    fail_run(s, p, what);
+    return ATTEMPT_RETRYABLE;
+  }
+
+  size_t eg_len = 0;
+  char *eg = read_file(p->engrad, &eg_len);
+  if (!eg) {
+    char what[PATH_MAX + 64];
+    snprintf(what, sizeof(what), "orca finished without writing %s",
+             p->engrad);
+    fail_run(s, p, what);
+    return ATTEMPT_RETRYABLE;
+  }
+  int *numbers = malloc(sizeof(int) * (size_t)n_atoms);
+  if (!numbers) {
+    free(eg);
+    session_error(s, "orcac: out of memory");
+    orcac_set_error("orcac: out of memory");
+    return ATTEMPT_FATAL;
+  }
+  const int parsed = orcac_engrad_parse(eg, eg_len, n_atoms, energy, grad,
+                                        numbers, err, sizeof(err));
+  free(eg);
+  if (parsed != 0) {
+    free(numbers);
+    fail_run(s, p, err + (strncmp(err, "orcac: ", 7) == 0 ? 7 : 0));
+    return ATTEMPT_FATAL;
+  }
+  const int same = memcmp(numbers, z, sizeof(int) * (size_t)n_atoms) == 0;
+  free(numbers);
+  if (!same) {
+    fail_run(s, p, "the .engrad atomic numbers differ from the input");
+    return ATTEMPT_FATAL;
+  }
+  return ATTEMPT_OK;
+}
+
+static int check_spin(const orcac_config *cfg, int n, const int *z,
+                      char *err, size_t errlen) {
+  long protons = 0;
+  for (int i = 0; i < n; ++i)
+    protons += z[i];
+  const long electrons = protons - cfg->charge;
+  const long unpaired = (long)cfg->multiplicity - 1;
+  if (electrons < 0 || electrons < unpaired ||
+      (electrons - unpaired) % 2 != 0) {
+    snprintf(err, errlen,
+             "orcac: charge %d and multiplicity %d are impossible for %ld "
+             "electrons",
+             cfg->charge, cfg->multiplicity, electrons);
+    return -1;
+  }
+  return 0;
+}
+
+static OrcaCResult fail_result(const char *text) {
+  OrcaCResult r;
+  memset(&r, 0, sizeof(r));
+  snprintf(r.message, sizeof(r.message), "%s", text ? text : "");
+  return r;
+}
+
+static OrcaCResult evaluate(OrcaCSession *s, int n_atoms, const double *pos,
+                            const int *z, double *grad_out, double sign) {
+  if (!s) {
+    orcac_set_error("orcac: null session");
+    return fail_result(orcac_last_error());
+  }
+  if (n_atoms < 1 || !pos || !z) {
+    orcac_set_error("orcac: empty geometry");
+    session_error(s, orcac_last_error());
+    return fail_result(orcac_last_error());
+  }
+  char err[1024] = "";
+  if (check_spin(&s->cfg, n_atoms, z, err, sizeof(err)) != 0) {
+    orcac_set_error("%s", err);
+    session_error(s, err);
+    return fail_result(err);
+  }
+  run_paths p = {run_file(s, ".inp"),    run_file(s, ".out"),
+                 run_file(s, ".err"),    run_file(s, ".engrad"),
+                 run_file(s, ".gbw"),    join_path(s->run_dir, k_guess)};
+  double *grad = malloc(sizeof(double) * 3u * (size_t)n_atoms);
+  if (!p.inp || !p.out || !p.err || !p.engrad || !p.gbw || !p.guess || !grad) {
+    free_paths(&p);
+    free(grad);
+    orcac_set_error("orcac: out of memory");
+    session_error(s, orcac_last_error());
+    return fail_result(orcac_last_error());
+  }
+
+  struct stat st;
+  const int use_guess =
+      s->cfg.restart && s->has_guess && s->guess_n == n_atoms &&
+      memcmp(s->guess_numbers, z, sizeof(int) * (size_t)n_atoms) == 0 &&
+      stat(p.guess, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0;
+  if (!use_guess)
+    drop_guess(s);
+  s->last_reused = 0;
+
+  double energy = 0.0;
+  int rc = attempt(s, &p, n_atoms, pos, z, use_guess, &energy, grad);
+  int reused = use_guess;
+  if (rc == ATTEMPT_RETRYABLE && use_guess) {
+    /* Stale or incompatible orbitals are a common cause of a failed start;
+     * try once more from ORCA's own guess. */
+    drop_guess(s);
+    rc = attempt(s, &p, n_atoms, pos, z, 0, &energy, grad);
+    reused = 0;
+  }
+  if (rc != ATTEMPT_OK) {
+    drop_guess(s);
+    OrcaCResult r = fail_result(s->error);
+    free_paths(&p);
+    free(grad);
+    return r;
+  }
+
+  if (s->cfg.restart) {
+    drop_guess(s);
+    if (stat(p.gbw, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {
+      if (copy_file(p.gbw, p.guess) == 0) {
+        s->guess_numbers = malloc(sizeof(int) * (size_t)n_atoms);
+        if (s->guess_numbers) {
+          memcpy(s->guess_numbers, z, sizeof(int) * (size_t)n_atoms);
+          s->guess_n = n_atoms;
+          s->has_guess = 1;
+        }
       }
     }
   }
-  if (st != ORCAC_OK) {
-    goto done;
+  s->last_reused = reused;
+  if (grad_out) {
+    for (size_t k = 0; k < 3u * (size_t)n_atoms; ++k)
+      grad_out[k] = sign * grad[k];
   }
+  free_paths(&p);
+  free(grad);
+  session_error(s, "");
+  orcac_set_error("%s", "");
 
-  if ((want & ORCAC_WANT_ENERGY) != 0) {
-    *energy_h = parsed.energy_h;
-  }
-  if ((want & ORCAC_WANT_GRADIENT) != 0) {
-    memcpy(gradient_h_bohr, parsed.gradient_h_bohr,
-           (size_t)n_atoms * 3u * sizeof(double));
-  }
-  if (key != NULL && access(paths.gbw, R_OK) == 0) {
-    orcac_cache_store(&s->guesses, s->run_dir, paths.gbw, key, n_atoms,
-                      atomic_numbers);
-  }
-
-done:
-  if (meta != NULL) {
-    meta->used_guess = info.used_guess;
-    meta->retried_fresh = info.retried_fresh;
-    meta->orca_runs = info.orca_runs;
-    meta->exit_code = info.exit_code;
-    meta->term_signal = info.term_signal;
-    meta->wall_s = now_s() - t0;
-  }
-  finish(s, meta, st, s->last_error);
-  pthread_mutex_unlock(&s->lock);
-  orcac_free_engrad(&parsed);
-  free(key);
-  free(paths.inp);
-  free(paths.out);
-  free(paths.err);
-  free(paths.engrad);
-  free(paths.gbw);
-  return st;
+  OrcaCResult r;
+  memset(&r, 0, sizeof(r));
+  r.ok = 1;
+  r.energy_h = energy;
+  r.reused_orbitals = reused;
+  return r;
 }
 
-/*
- * Copy rep into the caller's meta, never past its struct_size: a layout
- * that ends early gets the fields it has and as much of message, still
- * terminated, as fits.
- */
-static void publish(OrcaCResult *meta, OrcaCResult *rep) {
-  size_t n = rep->struct_size;
-  size_t at = offsetof(OrcaCResult, message);
-  if (n >= sizeof(*rep)) {
-    n = sizeof(*rep);
-  } else if (n > at) {
-    rep->message[n - at - 1u] = '\0';
+OrcaCResult orcac_session_energy_gradient(OrcaCSession *session, int n_atoms,
+                                          const double *positions_ang,
+                                          const int *atomic_numbers,
+                                          double *grad_h_bohr) {
+  if (!grad_h_bohr) {
+    orcac_set_error("orcac_session_energy_gradient: null gradient buffer");
+    return fail_result(orcac_last_error());
   }
-  memcpy(meta, rep, n);
+  return evaluate(session, n_atoms, positions_ang, atomic_numbers, grad_h_bohr,
+                  1.0);
 }
 
-int orcac_energy_gradient(OrcaCSession *s, int n_atoms,
-                          const double *positions_ang,
-                          const int *atomic_numbers, uint32_t want,
-                          double *energy_h, double *gradient_h_bohr,
-                          OrcaCResult *meta) {
-  OrcaCResult rep;
-  int st;
-  if (meta == NULL) {
-    return evaluate(s, n_atoms, positions_ang, atomic_numbers, want,
-                    energy_h, gradient_h_bohr, NULL);
+OrcaCResult orcac_session_energy_forces(OrcaCSession *session, int n_atoms,
+                                        const double *positions_ang,
+                                        const int *atomic_numbers,
+                                        double *forces_h_bohr) {
+  if (!forces_h_bohr) {
+    orcac_set_error("orcac_session_energy_forces: null forces buffer");
+    return fail_result(orcac_last_error());
   }
-  if (meta->struct_size < ORCAC_RESULT_MIN_SIZE) {
-    char msg[128];
-    snprintf(msg, sizeof(msg),
-             "orcac: meta struct_size %lu is below the ABI 1 minimum %lu",
-             (unsigned long)meta->struct_size,
-             (unsigned long)ORCAC_RESULT_MIN_SIZE);
-    return finish(NULL, NULL, ORCAC_E_INVALID, msg);
-  }
-  memset(&rep, 0, sizeof(rep));
-  rep.struct_size = meta->struct_size;
-  rep.exit_code = -1;
-  st = evaluate(s, n_atoms, positions_ang, atomic_numbers, want, energy_h,
-                gradient_h_bohr, &rep);
-  publish(meta, &rep);
-  return st;
+  return evaluate(session, n_atoms, positions_ang, atomic_numbers,
+                  forces_h_bohr, -1.0);
 }
 
-int orcac_cancel(OrcaCSession *s) {
-  if (s == NULL || getpid() != s->owner_pid) {
-    return ORCAC_E_INVALID;
-  }
-  atomic_fetch_add(&s->cancel_gen, 1u);
-  return ORCAC_OK;
+OrcaCResult orcac_session_energy(OrcaCSession *session, int n_atoms,
+                                 const double *positions_ang,
+                                 const int *atomic_numbers) {
+  return evaluate(session, n_atoms, positions_ang, atomic_numbers, NULL, 1.0);
 }
 
-const char *orcac_last_error(const OrcaCSession *s) {
-  return s != NULL ? s->last_error : tls_error;
+static OrcaCResult one_shot(int n_atoms, const double *pos, const int *z,
+                            const void *params, size_t size, double *out,
+                            double sign) {
+  if (!out) {
+    orcac_set_error("orcac: null output buffer");
+    return fail_result(orcac_last_error());
+  }
+  OrcaCSession *s = orcac_session_create(params, size);
+  if (!s)
+    return fail_result(orcac_last_error());
+  OrcaCResult r = evaluate(s, n_atoms, pos, z, out, sign);
+  char saved[ORCAC_ERR_CAP];
+  snprintf(saved, sizeof(saved), "%s", orcac_last_error());
+  orcac_session_destroy(s);
+  orcac_set_error("%s", saved);
+  return r;
 }
 
-void orcac_destroy(OrcaCSession *s) {
-  if (s == NULL) {
-    return;
-  }
-  if (getpid() == s->owner_pid) {
-    if (s->run_dir != NULL) {
-      orcac_remove_tree(s->run_dir);
-    }
-    pthread_mutex_destroy(&s->lock);
-  }
-  orcac_cache_free(&s->guesses);
-  free_settings(&s->settings);
-  free(s->exe);
-  free(s->run_dir);
-  free(s);
+OrcaCResult orcac_energy_gradient(int n_atoms, const double *positions_ang,
+                                  const int *atomic_numbers,
+                                  const void *params_capnp,
+                                  size_t params_capnp_size_bytes,
+                                  double *grad_h_bohr) {
+  return one_shot(n_atoms, positions_ang, atomic_numbers, params_capnp,
+                  params_capnp_size_bytes, grad_h_bohr, 1.0);
 }
 
-const char *orcac_status_name(int status) {
-  switch (status) {
-  case ORCAC_OK:
-    return "ORCAC_OK";
-  case ORCAC_E_INVALID:
-    return "ORCAC_E_INVALID";
-  case ORCAC_E_ERROR:
-    return "ORCAC_E_ERROR";
-  case ORCAC_E_UNSUPPORTED:
-    return "ORCAC_E_UNSUPPORTED";
-  case ORCAC_E_TIMEOUT:
-    return "ORCAC_E_TIMEOUT";
-  case ORCAC_E_NOT_CONVERGED:
-    return "ORCAC_E_NOT_CONVERGED";
-  case ORCAC_E_BUSY:
-    return "ORCAC_E_BUSY";
-  case ORCAC_E_NOT_FOUND:
-    return "ORCAC_E_NOT_FOUND";
-  case ORCAC_E_CANCELLED:
-    return "ORCAC_E_CANCELLED";
-  default:
-    return "unknown orcac status";
-  }
+OrcaCResult orcac_energy_forces(int n_atoms, const double *positions_ang,
+                                const int *atomic_numbers,
+                                const void *params_capnp,
+                                size_t params_capnp_size_bytes,
+                                double *forces_h_bohr) {
+  return one_shot(n_atoms, positions_ang, atomic_numbers, params_capnp,
+                  params_capnp_size_bytes, forces_h_bohr, -1.0);
 }
+
+/* ---- text entry points ---- */
+
+int orcac_render_input(const void *params_capnp, size_t params_capnp_size_bytes,
+                       int n_atoms, const double *positions_ang,
+                       const int *atomic_numbers, const char *moinp,
+                       char *buffer, size_t capacity, size_t *needed) {
+  char err[1024] = "";
+  orcac_config cfg;
+  if (orcac_decode_params(params_capnp, params_capnp_size_bytes, &cfg, err,
+                          sizeof(err)) != 0) {
+    orcac_set_error("%s", err);
+    return -1;
+  }
+  char *text = orcac_render(&cfg, n_atoms, positions_ang, atomic_numbers,
+                            moinp, err, sizeof(err));
+  orcac_config_free(&cfg);
+  if (!text) {
+    orcac_set_error("%s", err);
+    return -1;
+  }
+  const size_t len = strlen(text);
+  if (needed)
+    *needed = len;
+  int rc = 0;
+  if (!buffer || capacity < len + 1) {
+    orcac_set_error("orcac_render_input: buffer holds %zu bytes, %zu needed",
+                    capacity, len + 1);
+    rc = -1;
+  } else {
+    memcpy(buffer, text, len + 1);
+    orcac_set_error("%s", "");
+  }
+  free(text);
+  return rc;
+}
+
+int orcac_parse_engrad(const char *text, size_t length, int n_atoms,
+                       double *energy_h, double *grad_h_bohr,
+                       int *atomic_numbers) {
+  char err[1024] = "";
+  if (orcac_engrad_parse(text, length, n_atoms, energy_h, grad_h_bohr,
+                         atomic_numbers, err, sizeof(err)) != 0) {
+    orcac_set_error("%s", err);
+    return -1;
+  }
+  orcac_set_error("%s", "");
+  return 0;
+}
+
+int orcac_output_reports_scf_failure(const char *text, size_t length) {
+  return orcac_scf_failed(text, length);
+}
+
+/* ---- identity ---- */
 
 const char *orcac_version(void) { return ORCAC_VERSION_STRING; }
 int orcac_c_abi_version(void) { return RGPOT_ORCAC_C_ABI_VERSION; }
 int orcac_abi_version(void) { return ORCAC_ABI_VERSION; }
+const char *orcac_last_error(void) { return g_last_error; }
 
 int orcac_available(void) {
-  char buf[PATH_MAX];
-  return resolve_exe(NULL, buf, sizeof(buf), NULL, 0) == ORCAC_OK ? 1 : 0;
-}
-
-int orcac_probe_executable(const OrcaCConfig *config, char *resolved,
-                           size_t resolved_size) {
-  char err[ORCAC_LAST_ERROR_SIZE];
-  char exe[PATH_MAX];
-  int st;
-
-  OrcaCConfig copy;
-
-  err[0] = '\0';
-  if (config != NULL) {
-    st = read_config(config, &copy, err, sizeof(err));
-    if (st != ORCAC_OK) {
-      return finish(NULL, NULL, st, err);
-    }
-  }
-  st = resolve_exe(config != NULL ? copy.executable : NULL, exe,
-                   sizeof(exe), err, sizeof(err));
-  if (st != ORCAC_OK) {
-    return finish(NULL, NULL, st, err);
-  }
-  if (resolved != NULL) {
-    if (strlen(exe) >= resolved_size) {
-      snprintf(err, sizeof(err),
-               "orcac: resolved path needs %lu bytes, buffer has %lu",
-               (unsigned long)(strlen(exe) + 1u), (unsigned long)resolved_size);
-      return finish(NULL, NULL, ORCAC_E_INVALID, err);
-    }
-    memcpy(resolved, exe, strlen(exe) + 1u);
-  }
-  return finish(NULL, NULL, ORCAC_OK, "");
+  char path[PATH_MAX];
+  char saved[ORCAC_ERR_CAP];
+  snprintf(saved, sizeof(saved), "%s", g_last_error);
+  const int ok = orcac_resolve_executable(NULL, path, sizeof(path)) == 0;
+  snprintf(g_last_error, sizeof(g_last_error), "%s", saved);
+  return ok;
 }

@@ -1,23 +1,31 @@
 #!/usr/bin/env python3
 """Install orcac into a prefix, then compile a pkg-config consumer.
 
-The consumer uses the same `#include <orcac.h>` form as the sources and
-links only through `pkg-config --cflags --libs orcac` with
-PKG_CONFIG_PATH pointing at the installed prefix.
+The consumer links the installed package and exercises the rgpot surface
+that needs no ORCA installation: version and ABI queries, session argument
+checks, .engrad parsing and the Capabilities size query.
 """
 import argparse
 import os
 import shlex
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 
 CONSUMER_C = r"""
-#include <orcac.h>
+#include "orcac.h"
 
 #include <stdio.h>
 #include <string.h>
+
+static const char kEngrad[] =
+    "#\n# Number of atoms\n#\n 1\n"
+    "#\n# The current total energy in Eh\n#\n -0.5\n"
+    "#\n# The current gradient in Eh/bohr\n#\n 0.1\n 0.0\n -0.1\n"
+    "#\n# The atomic numbers and current coordinates in Bohr\n#\n"
+    "   1   0.0 0.0 0.0\n";
 
 int main(void) {
   const char *version = orcac_version();
@@ -25,52 +33,43 @@ int main(void) {
     fprintf(stderr, "empty version\n");
     return 1;
   }
-  if (orcac_c_abi_version() != RGPOT_ORCAC_C_ABI_VERSION) {
-    fprintf(stderr, "C ABI version mismatch\n");
-    return 1;
-  }
-  if (orcac_abi_version() != ORCAC_ABI_VERSION) {
+  if (orcac_c_abi_version() != RGPOT_ORCAC_C_ABI_VERSION ||
+      orcac_abi_version() != ORCAC_ABI_VERSION) {
     fprintf(stderr, "ABI version mismatch\n");
     return 1;
   }
   int available = orcac_available();
-  if (available != 0 && available != 1) {
-    fprintf(stderr, "orcac_available out of range\n");
-    return 1;
+
+  if (orcac_session_create(NULL, 0) != NULL) {
+    fprintf(stderr, "an empty ORCAParams message was accepted\n");
+    return 2;
+  }
+  orcac_session_destroy(NULL);
+  if (orcac_session_set_params(NULL, NULL, 0) == 0) {
+    fprintf(stderr, "null session_set_params accepted\n");
+    return 2;
+  }
+  double g[3];
+  OrcaCResult r = orcac_session_energy_gradient(NULL, 1, g, NULL, g);
+  if (r.ok) {
+    fprintf(stderr, "null session evaluated\n");
+    return 2;
   }
 
-  OrcaCConfig cfg;
-  if (orcac_config_init(&cfg, sizeof(cfg)) != ORCAC_OK) {
-    fprintf(stderr, "orcac_config_init failed\n");
-    return 2;
-  }
-  cfg.executable = "/bin/sh";
-  OrcaCSession *s = NULL;
-  char errbuf[256];
-  int st = orcac_create(&cfg, &s, errbuf, sizeof(errbuf));
-  if (st != ORCAC_OK || s == NULL) {
-    fprintf(stderr, "orcac_create: %s: %s\n", orcac_status_name(st), errbuf);
-    return 2;
-  }
   double e = 0.0;
-  OrcaCResult meta;
-  memset(&meta, 0, sizeof(meta));
-  meta.struct_size = sizeof(meta);
-  st = orcac_energy_gradient(s, 0, NULL, NULL, ORCAC_WANT_ENERGY, &e, NULL,
-                             &meta);
-  if (st != ORCAC_E_INVALID || meta.message[0] == '\0' ||
-      orcac_last_error(s)[0] == '\0') {
-    fprintf(stderr, "invalid call must fail with a message\n");
-    orcac_destroy(s);
+  int z = 0;
+  if (orcac_parse_engrad(kEngrad, strlen(kEngrad), 1, &e, g, &z) != 0 ||
+      e != -0.5 || g[0] != 0.1 || g[2] != -0.1 || z != 1) {
+    fprintf(stderr, "engrad parse: %s\n", orcac_last_error());
     return 3;
   }
-  if (orcac_configure(s, &cfg) != ORCAC_OK) {
-    fprintf(stderr, "orcac_configure failed\n");
-    orcac_destroy(s);
-    return 3;
+
+  size_t size = 0;
+  if (orcac_capabilities_result(NULL, 0, &size) != -1 || size == 0) {
+    fprintf(stderr, "capabilities size query failed\n");
+    return 4;
   }
-  orcac_destroy(s);
-  orcac_destroy(NULL);
+
   printf("installed-consumer ok: %s available=%d\n", version, available);
   return 0;
 }
@@ -90,8 +89,9 @@ def output(cmd, env=None):
 
 
 def lib_dirs(prefix: Path):
-    dirs = [d for d in (prefix / "lib", prefix / "lib64") if d.is_dir()]
-    return dirs + [d for d in (prefix / "lib").glob("*-linux-gnu*") if d.is_dir()]
+    return [d for d in (prefix / "lib", prefix / "lib64") if d.is_dir()] + list(
+        (prefix / "lib").glob("x86_64*")
+    )
 
 
 def pkg_config_env(prefix: Path):
@@ -134,25 +134,25 @@ def main() -> int:
             source,
             f"--prefix={prefix}",
             "-Dwith_tests=false",
+            "-Dschema_sync=disabled",
         ]
     )
     run([args.meson, "compile", "-C", inner_build])
     run([args.meson, "install", "-C", inner_build])
 
-    if not list(prefix.rglob("liborcac.so.1")):
+    so_links = list(prefix.rglob("liborcac.so.1"))
+    if not so_links:
         raise SystemExit("liborcac.so.1 not installed (soversion 1)")
-    headers = list(prefix.rglob("orcac.h"))
-    if [h.parent.name for h in headers] != ["orcac"]:
-        raise SystemExit(f"orcac.h must install under include/orcac: {headers}")
+    if not list(prefix.rglob("orcac.h")):
+        raise SystemExit("orcac.h not installed")
     if not list(prefix.rglob("orcac.pc")):
         raise SystemExit("orcac.pc not installed")
 
     env = pkg_config_env(prefix)
     output([args.pkg_config, "--modversion", "orcac"], env=env)
+    output([args.pkg_config, "--cflags", "--libs", "orcac"], env=env)
     cflags = shlex.split(output([args.pkg_config, "--cflags", "orcac"], env=env))
     libs = shlex.split(output([args.pkg_config, "--libs", "orcac"], env=env))
-    if f"-I{prefix}/include/orcac" not in cflags:
-        raise SystemExit(f"pkg-config cflags miss the orcac include dir: {cflags}")
 
     consumer_dir = build_root / "consumer"
     consumer_dir.mkdir()

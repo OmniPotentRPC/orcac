@@ -1,0 +1,30 @@
+#
+# Number of atoms
+#
+ 3
+#
+# The current total energy in Eh
+#
+    -76.326775405024
+#
+# The current gradient in Eh/bohr
+#
+       0.000000000000
+       0.000000000000
+       0.012473810462
+      -0.009128373315
+       0.000000000000
+      -0.006236905231
+       0.009128373315
+       0.000000000000
+      -0.006236905231
+#
+# The atomic numbers and current coordinates in Bohr
+#
+   8     0.0000000    0.0000000   -0.1294183
+   1    -1.4941816    0.0000000    1.0269706
+   1     1.4941816    0.0000000    1.0269706
+#
+# An extra labelled block a later ORCA release could append
+#
+     1.0 2.0 3.0
