@@ -5,9 +5,9 @@
 #include "orca_runner.h"
 #include "orcac_errbuf.h"
 
-#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <dirent.h>
 #include <limits.h>
 #include <poll.h>
 #include <signal.h>
@@ -501,48 +501,182 @@ int orcac_run_orca(const char *executable,
   return 0;
 }
 
-int orcac_remove_tree(const char *path) {
-  struct stat st;
-  int rc = 0;
-  if (path == NULL || path[0] == '\0') {
-    return -1;
-  }
-  if (lstat(path, &st) != 0) {
-    return errno == ENOENT ? 0 : -1;
-  }
-  if (S_ISDIR(st.st_mode)) {
-    DIR *dir = opendir(path);
-    struct dirent *ent;
-    if (dir == NULL) {
+#ifdef ORCAC_TEST_HOOKS
+void (*orcac_test_remove_hook)(int dirfd, const char *name) = NULL;
+#endif
+
+/* Deeper trees are refused rather than holding a descriptor per level. */
+#define ORCAC_REMOVE_MAX_DEPTH 64
+/* Passes over one directory before entries that keep appearing win. */
+#define ORCAC_REMOVE_MAX_PASSES 8
+/* Retries when an entry changes type between open and unlink. */
+#define ORCAC_REMOVE_MAX_TRIES 4
+
+static int empty_dir_fd(int fd, const struct stat *self,
+                        const struct stat *parent, int depth);
+
+static int keep_errno(int first, int now) {
+  return first != 0 ? first : now;
+}
+
+static int is_dot_name(const char *name) {
+  return name[0] == '.' &&
+         (name[1] == '\0' || (name[1] == '.' && name[2] == '\0'));
+}
+
+/*
+ * 1 while the directory open at fd still sits directly in the directory
+ * described by parent, so a subtree moved elsewhere mid-walk is left
+ * alone.
+ */
+static int still_below(int fd, const struct stat *parent) {
+  struct stat up;
+  return fstatat(fd, "..", &up, 0) == 0 && up.st_dev == parent->st_dev &&
+         up.st_ino == parent->st_ino;
+}
+
+static int remove_entry_at(int dirfd, const struct stat *parent,
+                           const char *name, int depth) {
+  for (int tries = 0; tries < ORCAC_REMOVE_MAX_TRIES; ++tries) {
+    struct stat st;
+    int rc;
+    int fd = openat(dirfd, name,
+                    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+      if (errno == ENOENT) {
+        return 0;
+      }
+      if (errno != ENOTDIR && errno != ELOOP) {
+        return -1;
+      }
+      /* A file or a symlink: remove the entry itself. */
+      if (unlinkat(dirfd, name, 0) == 0 || errno == ENOENT) {
+        return 0;
+      }
+      if (errno == EISDIR || errno == EPERM) {
+        continue;
+      }
       return -1;
     }
-    while ((ent = readdir(dir)) != NULL) {
-      size_t na;
-      size_t nb;
-      char *child;
-      if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
-        continue;
-      }
-      na = strlen(path);
-      nb = strlen(ent->d_name);
-      child = (char *)malloc(na + nb + 2u);
-      if (child == NULL) {
-        rc = -1;
-        continue;
-      }
-      memcpy(child, path, na);
-      child[na] = '/';
-      memcpy(child + na + 1u, ent->d_name, nb + 1u);
-      if (orcac_remove_tree(child) != 0) {
-        rc = -1;
-      }
-      free(child);
+    if (fstat(fd, &st) != 0) {
+      int saved = errno;
+      close(fd);
+      errno = saved;
+      return -1;
     }
-    closedir(dir);
-    if (rmdir(path) != 0) {
-      rc = -1;
+    if (st.st_dev != parent->st_dev || depth >= ORCAC_REMOVE_MAX_DEPTH) {
+      close(fd);
+      errno = st.st_dev != parent->st_dev ? EXDEV : ELOOP;
+      return -1;
     }
-    return rc;
+#ifdef ORCAC_TEST_HOOKS
+    if (orcac_test_remove_hook != NULL) {
+      orcac_test_remove_hook(dirfd, name);
+    }
+#endif
+    if (!still_below(fd, parent)) {
+      close(fd);
+      errno = EXDEV;
+      return -1;
+    }
+    rc = empty_dir_fd(fd, &st, parent, depth + 1);
+    if (rc != 0) {
+      return -1;
+    }
+    if (unlinkat(dirfd, name, AT_REMOVEDIR) == 0 || errno == ENOENT) {
+      return 0;
+    }
+    if (errno != ENOTDIR) {
+      return -1;
+    }
+    /* Swapped for a non-directory after it was opened: go again. */
   }
-  return unlink(path) == 0 ? 0 : -1;
+  errno = EAGAIN;
+  return -1;
+}
+
+/*
+ * Remove every entry of the directory open at fd, which this closes.
+ * Each entry is opened relative to fd with O_NOFOLLOW, so a symlink is
+ * unlinked itself and a directory swapped for a symlink is never entered.
+ * With parent set, the walk stops once fd no longer sits in parent.
+ */
+static int empty_dir_fd(int fd, const struct stat *self,
+                        const struct stat *parent, int depth) {
+  DIR *dir = fdopendir(fd);
+  int first = 0;
+  if (dir == NULL) {
+    int saved = errno;
+    close(fd);
+    errno = saved;
+    return -1;
+  }
+  for (int pass = 0; pass < ORCAC_REMOVE_MAX_PASSES; ++pass) {
+    struct dirent *ent;
+    int seen = 0;
+    int removed = 0;
+    rewinddir(dir);
+    for (;;) {
+      errno = 0;
+      ent = readdir(dir);
+      if (ent == NULL) {
+        if (errno != 0) {
+          first = keep_errno(first, errno);
+        }
+        break;
+      }
+      if (is_dot_name(ent->d_name)) {
+        continue;
+      }
+      ++seen;
+      if (parent != NULL && !still_below(dirfd(dir), parent)) {
+        first = keep_errno(first, EXDEV);
+        break;
+      }
+      if (remove_entry_at(dirfd(dir), self, ent->d_name, depth) == 0) {
+        ++removed;
+      } else {
+        first = keep_errno(first, errno);
+      }
+    }
+    if (seen == 0 || removed == 0 || first != 0) {
+      break;
+    }
+  }
+  closedir(dir);
+  if (first != 0) {
+    errno = first;
+    return -1;
+  }
+  return 0;
+}
+
+int orcac_empty_dir(int dirfd) {
+  struct stat st;
+  int fd;
+  if (dirfd < 0 || fstat(dirfd, &st) != 0) {
+    return -1;
+  }
+  if (!S_ISDIR(st.st_mode)) {
+    errno = ENOTDIR;
+    return -1;
+  }
+  fd = openat(dirfd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (fd < 0) {
+    return -1;
+  }
+  return empty_dir_fd(fd, &st, NULL, 0);
+}
+
+int orcac_remove_tree_at(int dirfd, const char *name) {
+  struct stat st;
+  if (dirfd < 0 || name == NULL || name[0] == '\0' || is_dot_name(name) ||
+      strchr(name, '/') != NULL) {
+    errno = EINVAL;
+    return -1;
+  }
+  if (fstat(dirfd, &st) != 0) {
+    return -1;
+  }
+  return remove_entry_at(dirfd, &st, name, 0);
 }

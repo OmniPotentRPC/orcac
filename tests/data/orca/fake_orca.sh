@@ -4,9 +4,14 @@
 # ORCAC_FAKE_REPLAY is the directory holding the synthetic fixtures.
 #
 # Modes, all optional:
-#   ORCAC_FAKE_LOG           append the cwd and the input deck to this file
+#   ORCAC_FAKE_LOG           append the cwd, its files and the input deck
+#                            to this file
 #   ORCAC_FAKE_STARTED       create this file once the run has started
 #   ORCAC_FAKE_ENV_LOG       write the child environment to this file
+#   ORCAC_FAKE_SYMLINK_TARGET  plant symlinks to this directory and to
+#                            its file "precious" in the run directory
+#   ORCAC_FAKE_LOCKED        leave a directory "locked" holding a file,
+#                            with its write permission removed
 #   ORCAC_FAKE_SLEEP         sleep this many seconds first
 #   ORCAC_FAKE_STRAY_PIDFILE leave a background child, write its pid here
 #   ORCAC_FAKE_FAIL          print an error and exit with this status
@@ -35,6 +40,7 @@ base=${inp%.inp}
 if [ -n "$log" ]; then
   printf '=== %s ===\n' "$inp" >> "$log"
   printf 'CWD %s\n' "$(pwd)" >> "$log"
+  printf 'FILES %s\n' "$(/bin/ls -A | /usr/bin/tr '\n' ' ')" >> "$log"
   /bin/cat "$inp" >> "$log"
 fi
 if [ -n "${ORCAC_FAKE_STARTED:-}" ]; then
@@ -45,6 +51,17 @@ if [ -n "${ORCAC_FAKE_ENV_LOG:-}" ]; then
 fi
 if [ -n "${ORCAC_FAKE_FD_LOG:-}" ]; then
   /bin/ls -l "/proc/$$/fd" > "${ORCAC_FAKE_FD_LOG}" 2>&1
+fi
+if [ -n "${ORCAC_FAKE_SYMLINK_TARGET:-}" ]; then
+  /bin/ln -s "${ORCAC_FAKE_SYMLINK_TARGET}" escape_dir
+  /bin/ln -s "${ORCAC_FAKE_SYMLINK_TARGET}/precious" escape_file
+  /bin/mkdir nested
+  /bin/ln -s "${ORCAC_FAKE_SYMLINK_TARGET}" nested/escape_dir
+fi
+if [ -n "${ORCAC_FAKE_LOCKED:-}" ]; then
+  /bin/mkdir locked
+  : > locked/file
+  /bin/chmod 0500 locked
 fi
 
 if [ -n "${ORCAC_FAKE_SLEEP:-}" ]; then

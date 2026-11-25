@@ -70,6 +70,37 @@ static int count_entries(const char *dir_path) {
   return n;
 }
 
+/* The single entry of dir_path as a full path, or NULL. */
+static char *only_entry(const char *dir_path) {
+  DIR *dir = opendir(dir_path);
+  struct dirent *ent;
+  char *found = NULL;
+  int n = 0;
+  if (dir == NULL) {
+    return NULL;
+  }
+  while ((ent = readdir(dir)) != NULL) {
+    if (strcmp(ent->d_name, ".") != 0 && strcmp(ent->d_name, "..") != 0) {
+      ++n;
+      if (found == NULL) {
+        found = join(dir_path, ent->d_name);
+      }
+    }
+  }
+  closedir(dir);
+  if (n != 1) {
+    free(found);
+    return NULL;
+  }
+  return found;
+}
+
+static int is_dir_with_mode(const char *path, mode_t mode) {
+  struct stat st;
+  return lstat(path, &st) == 0 && S_ISDIR(st.st_mode) &&
+         (st.st_mode & 07777) == mode;
+}
+
 static int remove_tree(const char *path) {
   struct stat st;
   if (lstat(path, &st) != 0) {
@@ -422,6 +453,155 @@ int main(int argc, char **argv) {
       return fail("SIGTERM wait was not cut short");
     }
     orcac_destroy(pot);
+  }
+
+  /* Session layout, emptied run/, kept failures and symlink safety. */
+  {
+    char *session = only_entry(scratch);
+    char *run;
+    char *guess;
+    char *keep;
+    char *failed;
+    char *stale;
+    char *outside = join(work, "outside");
+    char *precious = join(outside, "precious");
+    char *kept_inp;
+    FILE *fp;
+    cfg = base_config(fake_bin, scratch);
+    pot = make(&cfg);
+    if (pot == NULL) {
+      return fail("orcac_create for the session layout failed");
+    }
+    free(session);
+    session = only_entry(scratch);
+    if (session == NULL) {
+      return fail("expected one session directory");
+    }
+    run = join(session, "run");
+    guess = join(session, "guess");
+    keep = join(session, "keep");
+    failed = join(keep, "failed");
+    stale = join(run, "stale.gbw");
+    kept_inp = join(failed, "orcac.inp");
+    if (!is_dir_with_mode(session, 0700) || !is_dir_with_mode(run, 0700) ||
+        !is_dir_with_mode(guess, 0700) || !is_dir_with_mode(keep, 0700)) {
+      return fail("session directories are not private 0700 directories");
+    }
+
+    fp = fopen(stale, "w");
+    if (fp == NULL) {
+      return fail("could not plant a stale file");
+    }
+    fputs("stale", fp);
+    fclose(fp);
+    unlink(log_file);
+    st = eval(pot, &e, g, &meta);
+    if (check_replay(st, &meta, e, g) != 0) {
+      return 1;
+    }
+    text = slurp(log_file);
+    if (text == NULL ||
+        strstr(text, "FILES orcac.err orcac.inp orcac.out \n") == NULL ||
+        strstr(text, "stale.gbw") != NULL) {
+      return fail("ORCA did not start in an emptied run directory");
+    }
+    free(text);
+    if (count_entries(run) != 0 || count_entries(guess) != 1) {
+      return fail("run/ not emptied or guess not stored in guess/");
+    }
+
+    if (mkdir(outside, 0755) != 0 || (fp = fopen(precious, "w")) == NULL) {
+      return fail("could not create the outside directory");
+    }
+    fputs("keep me", fp);
+    fclose(fp);
+    setenv("ORCAC_FAKE_SYMLINK_TARGET", outside, 1);
+    st = eval(pot, &e, g, &meta);
+    if (check_replay(st, &meta, e, g) != 0) {
+      return 1;
+    }
+    setenv("ORCAC_FAKE_FAIL", "3", 1);
+    st = eval(pot, &e, g, &meta);
+    unsetenv("ORCAC_FAKE_FAIL");
+    if (st != ORCAC_E_ERROR) {
+      return fail("forced failure in the layout block");
+    }
+    if (access(kept_inp, R_OK) != 0 || count_entries(run) != 0 ||
+        strstr(meta.message, "run files kept in ") == NULL ||
+        strstr(meta.message, failed) == NULL ||
+        strstr(orcac_last_error(pot), "fake orca stderr line") == NULL) {
+      return fail("failed run not kept in keep/failed and named");
+    }
+    if (count_entries(guess) != 0) {
+      return fail("failed MORead run left its guess slot");
+    }
+    orcac_destroy(pot);
+    unsetenv("ORCAC_FAKE_SYMLINK_TARGET");
+    if (access(session, F_OK) == 0) {
+      return fail("orcac_destroy left the session directory");
+    }
+    text = slurp(precious);
+    if (text == NULL || strcmp(text, "keep me") != 0 ||
+        count_entries(outside) != 1) {
+      return fail("removal followed a symlink out of the session");
+    }
+    free(text);
+    free(session);
+    free(run);
+    free(guess);
+    free(keep);
+    free(failed);
+    free(stale);
+    free(kept_inp);
+    free(precious);
+    free(outside);
+  }
+
+  /*
+   * A run/ that cannot be emptied after a success keeps ORCAC_OK and an
+   * empty message; the next call stops before ORCA and names both.
+   */
+  if (geteuid() != 0) {
+    char *session;
+    char *locked;
+    cfg = base_config(fake_bin, scratch);
+    cfg.guess_policy = ORCAC_GUESS_FRESH;
+    pot = make(&cfg);
+    if (pot == NULL) {
+      return fail("orcac_create for the cleanup check failed");
+    }
+    session = only_entry(scratch);
+    if (session == NULL) {
+      return fail("expected one session directory");
+    }
+    locked = join(session, "run/locked");
+    setenv("ORCAC_FAKE_LOCKED", "1", 1);
+    st = eval(pot, &e, g, &meta);
+    unsetenv("ORCAC_FAKE_LOCKED");
+    if (check_replay(st, &meta, e, g) != 0) {
+      return 1;
+    }
+    if (access(locked, F_OK) != 0 || orcac_last_error(pot)[0] != '\0') {
+      return fail("cleanup failure after a success changed its report");
+    }
+    st = eval(pot, &e, g, &meta);
+    if (st != ORCAC_E_ERROR || meta.orca_runs != 0 ||
+        strstr(meta.message, "could not empty") == NULL ||
+        strstr(orcac_last_error(pot),
+               "after the previous successful call: orcac: could not "
+               "empty") == NULL) {
+      fprintf(stderr, "%s: %s\n", orcac_status_name(st),
+              orcac_last_error(pot));
+      return fail("unemptied run/ not reported by the next call");
+    }
+    chmod(locked, 0700);
+    st = eval(pot, &e, g, &meta);
+    if (check_replay(st, &meta, e, g) != 0) {
+      return 1;
+    }
+    orcac_destroy(pot);
+    free(locked);
+    free(session);
   }
 
 #ifdef __linux__

@@ -5,10 +5,10 @@
 /*
  * MORead guess slots. Each slot holds the .gbw of the last successful
  * run for one key and composition (the ordered atomic numbers) as a file
- * in the run directory. The key is an opaque string the caller builds
- * from every setting that changes the wavefunction. Lookups match key
- * and composition exactly; a store reuses the matching slot or evicts
- * the least recently stored one.
+ * in the session's guess directory, passed as run_dir. The key is an
+ * opaque string the caller builds from every setting that changes the
+ * wavefunction. Lookups match key and composition exactly; a store
+ * reuses the matching slot or evicts the least recently stored one.
  */
 
 #define ORCAC_GUESS_SLOTS 4
@@ -45,6 +45,10 @@ int orcac_cache_lookup(const OrcacGuessCache *cache, const char *run_dir,
 int orcac_cache_store(OrcacGuessCache *cache, const char *run_dir,
                       const char *gbw_path, const char *key, int n_atoms,
                       const int *atomic_numbers);
+
+/* Copy the slot's file to dest_dir under its slot name. */
+int orcac_cache_copy_out(const char *cache_dir, int slot,
+                         const char *dest_dir);
 
 /* Invalidate one slot and remove its file. Out-of-range slots are ignored. */
 void orcac_cache_drop(OrcacGuessCache *cache, const char *run_dir, int slot);

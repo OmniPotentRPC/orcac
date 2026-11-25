@@ -70,4 +70,21 @@ int orcac_run_orca(const char *executable,
                    char *errbuf,
                    size_t errbuf_n);
 
-int orcac_remove_tree(const char *path);
+/*
+ * Remove the entry name of the directory open at dirfd and everything
+ * below it. name is one path component. The walk holds a descriptor per
+ * level and opens each entry relative to its parent with O_NOFOLLOW: a
+ * symlink is unlinked and its target left alone, a directory swapped
+ * for a symlink mid-walk is never entered, and a subtree that is moved
+ * out of its parent or sits on another device is left in place with -1.
+ * A missing entry is 0. On -1, errno holds the first failure.
+ */
+int orcac_remove_tree_at(int dirfd, const char *name);
+
+/* Remove everything inside the directory open at dirfd, as above. */
+int orcac_empty_dir(int dirfd);
+
+#ifdef ORCAC_TEST_HOOKS
+/* Called after a subdirectory is opened, before it is emptied. */
+extern void (*orcac_test_remove_hook)(int dirfd, const char *name);
+#endif

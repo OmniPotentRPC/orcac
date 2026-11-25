@@ -1,19 +1,26 @@
 /*
  * Library internals, built from the sources with ORCAC_TEST_HOOKS:
- * strict engrad number parsing, guess-cache eviction order, and a
- * cancel issued in the window after a call has taken the session lock
- * but before ORCA starts.
+ * strict engrad number parsing, guess-cache eviction order, a cancel
+ * issued in the window after a call has taken the session lock but
+ * before ORCA starts, and tree removal while directories are swapped
+ * for symlinks or moved out.
  */
 #include <orcac.h>
 
 #include "orca_parse.h"
+#include "orca_runner.h"
 #include "orcac_cache.h"
 #include "orcac_internal.h"
 
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static int failures = 0;
@@ -296,6 +303,184 @@ static void test_cancel_window(const char *fake_bin, const char *scratch) {
   orcac_destroy(s);
 }
 
+/* f1, f2 and b/g below dir, each file holding its own name. */
+static void make_tree(const char *dir) {
+  char path[4096];
+  CHECK(mkdir(dir, 0700) == 0, "mkdir tree");
+  snprintf(path, sizeof(path), "%s/f1", dir);
+  write_file(path, "f1");
+  snprintf(path, sizeof(path), "%s/f2", dir);
+  write_file(path, "f2");
+  snprintf(path, sizeof(path), "%s/b", dir);
+  CHECK(mkdir(path, 0700) == 0, "mkdir tree/b");
+  snprintf(path, sizeof(path), "%s/b/g", dir);
+  write_file(path, "g");
+}
+
+static int file_is(const char *dir, const char *name, const char *text) {
+  char path[4096];
+  char buf[64];
+  size_t got;
+  FILE *fp;
+  snprintf(path, sizeof(path), "%s/%s", dir, name);
+  fp = fopen(path, "rb");
+  if (fp == NULL) {
+    return 0;
+  }
+  got = fread(buf, 1u, sizeof(buf) - 1u, fp);
+  fclose(fp);
+  buf[got] = '\0';
+  return strcmp(buf, text) == 0;
+}
+
+static int tree_intact(const char *dir) {
+  return file_is(dir, "f1", "f1") && file_is(dir, "f2", "f2") &&
+         file_is(dir, "b/g", "g");
+}
+
+static int entry_count(const char *dir) {
+  DIR *d = opendir(dir);
+  struct dirent *ent;
+  int n = 0;
+  if (d == NULL) {
+    return -1;
+  }
+  while ((ent = readdir(d)) != NULL) {
+    if (strcmp(ent->d_name, ".") != 0 && strcmp(ent->d_name, "..") != 0) {
+      ++n;
+    }
+  }
+  closedir(d);
+  return n;
+}
+
+enum { SWAP_FOR_SYMLINK = 1, MOVE_OUT = 2 };
+static int swap_mode = 0;
+static int swap_calls = 0;
+static char swap_outside[PATH_MAX + 16];
+
+/* Runs once the walk holds a descriptor for "a", before emptying it. */
+static void swap_on_open(int dirfd, const char *name) {
+  char moved[PATH_MAX + 64];
+  if (strcmp(name, "a") != 0 || swap_calls++ != 0) {
+    return;
+  }
+  if (swap_mode == SWAP_FOR_SYMLINK) {
+    CHECK(renameat(dirfd, "a", dirfd, "a.real") == 0 &&
+              symlinkat(swap_outside, dirfd, "a") == 0,
+          "swap a for a symlink");
+  } else {
+    snprintf(moved, sizeof(moved), "%s/moved", swap_outside);
+    CHECK(renameat(dirfd, "a", AT_FDCWD, moved) == 0, "move a out");
+  }
+}
+
+/*
+ * The session remover against symlinks placed beforehand and against a
+ * directory swapped for a symlink, or moved out, after the walk opened
+ * it. The outside tree mirrors the names inside, so a path-based walk
+ * through the symlink would delete outside files.
+ */
+static void test_remove_tree(void) {
+  char work[] = "orcac-remove-XXXXXX";
+  char base[PATH_MAX];
+  char root[PATH_MAX + 16];
+  char outside[PATH_MAX + 16];
+  char path[PATH_MAX + 64];
+  char moved[PATH_MAX + 64];
+  int work_fd;
+  int fd;
+  int rc;
+
+  if (mkdtemp(work) == NULL) {
+    fprintf(stderr, "FAIL: mkdtemp\n");
+    ++failures;
+    return;
+  }
+  if (realpath(work, base) == NULL) {
+    fprintf(stderr, "FAIL: realpath\n");
+    ++failures;
+    return;
+  }
+  snprintf(root, sizeof(root), "%s/root", base);
+  snprintf(outside, sizeof(outside), "%s/outside", base);
+  snprintf(swap_outside, sizeof(swap_outside), "%s", outside);
+  make_tree(outside);
+  work_fd = open(work, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  CHECK(work_fd >= 0, "open work");
+
+  /* Symlinks already in the tree are unlinked, never followed. */
+  make_tree(root);
+  snprintf(path, sizeof(path), "%s/link", root);
+  CHECK(symlink(outside, path) == 0, "symlink link");
+  snprintf(path, sizeof(path), "%s/b/flink", root);
+  snprintf(moved, sizeof(moved), "%s/f1", outside);
+  CHECK(symlink(moved, path) == 0, "symlink b/flink");
+  snprintf(path, sizeof(path), "%s/b/dlink", root);
+  CHECK(symlink(outside, path) == 0, "symlink b/dlink");
+  fd = open(root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  CHECK(fd >= 0 && orcac_empty_dir(fd) == 0, "empty a tree with symlinks");
+  CHECK(entry_count(root) == 0, "tree with symlinks not emptied");
+  CHECK(tree_intact(outside), "pre-placed symlink followed");
+  if (fd >= 0) {
+    close(fd);
+  }
+  CHECK(orcac_remove_tree_at(work_fd, "root") == 0 && access(root, F_OK) != 0,
+        "remove the emptied root");
+
+  /* A root that is itself a symlink: only the link goes. */
+  CHECK(symlink(outside, root) == 0, "symlink root");
+  CHECK(orcac_remove_tree_at(work_fd, "root") == 0, "remove a root symlink");
+  CHECK(access(root, F_OK) != 0 && tree_intact(outside),
+        "root symlink followed");
+  CHECK(orcac_remove_tree_at(work_fd, "../x") != 0 && errno == EINVAL &&
+            orcac_remove_tree_at(work_fd, "..") != 0 && errno == EINVAL,
+        "names that leave the directory accepted");
+
+  /* "a" becomes a symlink to outside after the walk opened it. */
+  CHECK(mkdir(root, 0700) == 0, "mkdir root");
+  snprintf(path, sizeof(path), "%s/a", root);
+  make_tree(path);
+  swap_mode = SWAP_FOR_SYMLINK;
+  swap_calls = 0;
+  orcac_test_remove_hook = swap_on_open;
+  fd = open(root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  rc = fd >= 0 ? orcac_empty_dir(fd) : -1;
+  orcac_test_remove_hook = NULL;
+  CHECK(swap_calls >= 1, "swap hook not reached");
+  CHECK(tree_intact(outside) && entry_count(outside) == 3,
+        "swap for a symlink reached outside");
+  CHECK(rc == 0 && entry_count(root) == 0,
+        "swapped tree not emptied, symlink included");
+  if (fd >= 0) {
+    close(fd);
+  }
+
+  /* "a" is moved out of the root after the walk opened it. */
+  make_tree(path);
+  swap_mode = MOVE_OUT;
+  swap_calls = 0;
+  orcac_test_remove_hook = swap_on_open;
+  fd = open(root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  errno = 0;
+  rc = fd >= 0 ? orcac_empty_dir(fd) : -1;
+  CHECK(rc != 0 && errno == EXDEV, "walk followed a subtree moved out");
+  orcac_test_remove_hook = NULL;
+  snprintf(moved, sizeof(moved), "%s/moved", outside);
+  CHECK(tree_intact(moved) && tree_intact(outside),
+        "moved-out subtree touched");
+  if (fd >= 0) {
+    close(fd);
+  }
+
+  CHECK(orcac_remove_tree_at(work_fd, "root") == 0, "remove root");
+  CHECK(orcac_remove_tree_at(work_fd, "outside") == 0, "remove outside");
+  if (work_fd >= 0) {
+    close(work_fd);
+  }
+  CHECK(rmdir(work) == 0, "work directory left non-empty");
+}
+
 int main(int argc, char **argv) {
   char fake_bin[4096];
   char replay[4096];
@@ -316,6 +501,7 @@ int main(int argc, char **argv) {
   test_cache_eviction(scratch);
   test_cancel_window(fake_bin, scratch);
   rmdir(scratch);
+  test_remove_tree();
 
   if (failures != 0) {
     fprintf(stderr, "%d check(s) failed\n", failures);

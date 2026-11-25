@@ -24,6 +24,7 @@ endif
 liborcac_sources = files(
   'src/orcac.c',
   'src/orcac_cache.c',
+  'src/orcac_session.c',
   'src/orca_input.c',
   'src/orca_parse.c',
   'src/orca_runner.c',

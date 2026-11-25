@@ -194,6 +194,25 @@ int orcac_cache_store(OrcacGuessCache *cache, const char *run_dir,
   return target;
 }
 
+int orcac_cache_copy_out(const char *cache_dir, int slot,
+                         const char *dest_dir) {
+  char name[ORCAC_GUESS_NAME_SIZE];
+  char *from;
+  char *to;
+  int rc;
+  if (cache_dir == NULL || dest_dir == NULL || slot < 0 ||
+      slot >= ORCAC_GUESS_SLOTS) {
+    return -1;
+  }
+  orcac_cache_slot_name(slot, name);
+  from = slot_path(cache_dir, name);
+  to = slot_path(dest_dir, name);
+  rc = (from != NULL && to != NULL) ? copy_file(from, to) : -1;
+  free(from);
+  free(to);
+  return rc;
+}
+
 void orcac_cache_drop(OrcacGuessCache *cache, const char *run_dir, int slot) {
   if (cache == NULL || slot < 0 || slot >= ORCAC_GUESS_SLOTS) {
     return;
