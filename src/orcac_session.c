@@ -13,6 +13,7 @@
 #ifdef ORCAC_TEST_HOOKS
 void (*orcac_test_after_keep)(int root_fd) = NULL;
 void (*orcac_test_before_keep)(int root_fd, int keep_fd) = NULL;
+int (*orcac_test_remove_fail)(const OrcacSessionDirs *dirs) = NULL;
 int (*orcac_test_paths_fail)(int parent_fd, const char *root_name) = NULL;
 int orcac_test_alloc_fail = 0;
 #endif
@@ -102,6 +103,19 @@ static int remove_root(const OrcacSessionDirs *dirs, const char *name) {
   return orcac_remove_pinned_dir(dirs->parent_fd, dirs->root_fd, name);
 }
 
+static int remove_session_root(const OrcacSessionDirs *dirs) {
+#ifdef ORCAC_TEST_HOOKS
+  if (orcac_test_remove_fail != NULL) {
+    int injected = orcac_test_remove_fail(dirs);
+    if (injected != 0) {
+      errno = injected;
+      return -1;
+    }
+  }
+#endif
+  return remove_root(dirs, dirs->root_name);
+}
+
 /*
  * Undo a root that was just made and is still empty, without
  * allocating, so allocation failing for good cannot leave it behind.
@@ -155,7 +169,7 @@ int orcac_session_remove(OrcacSessionDirs *dirs, char *errbuf,
   close_fd(&dirs->run_fd);
   close_fd(&dirs->guess_fd);
   close_fd(&dirs->keep_fd);
-  if (remove_root(dirs, dirs->root_name) == 0) {
+  if (remove_session_root(dirs) == 0) {
     orcac_session_free(dirs);
     return 0;
   }
@@ -176,7 +190,7 @@ int orcac_session_close(OrcacSessionDirs *dirs, char *errbuf,
     close_fd(&dirs->run_fd);
     close_fd(&dirs->guess_fd);
     close_fd(&dirs->keep_fd);
-    if (remove_root(dirs, dirs->root_name) != 0) {
+    if (remove_session_root(dirs) != 0) {
       orcac_errf(errbuf, errbuf_n,
                  "orcac: could not remove session directory %s: %s",
                  dirs->root, strerror(errno));

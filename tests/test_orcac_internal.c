@@ -1439,6 +1439,153 @@ static void test_configure_cleanup_fails(const char *fake_bin,
   CHECK(entry_count(scratch) == before, "scratch not back to its entries");
 }
 
+static char fail_old_root[PATH_MAX + 32];
+static char fail_new_prefix[PATH_MAX + 32];
+static int fail_new_calls = 0;
+
+/* EIO for the root in fail_old_root and for any root below the prefix. */
+static int fail_removal(const OrcacSessionDirs *dirs) {
+  if (fail_old_root[0] != '\0' && strcmp(dirs->root, fail_old_root) == 0) {
+    return EIO;
+  }
+  if (fail_new_prefix[0] != '\0' &&
+      strncmp(dirs->root, fail_new_prefix, strlen(fail_new_prefix)) == 0) {
+    ++fail_new_calls;
+    return EIO;
+  }
+  return 0;
+}
+
+/*
+ * orcac_configure to a new scratch_dir, with the old tree's removal
+ * failing and then the new tree's removal failing too: the error names
+ * both, the session keeps the new tree pinned, the next move retries it
+ * first and fails without changing anything while it still cannot, and
+ * orcac_destroy removes it or names it.
+ */
+static void test_configure_rollback_fails(const char *fake_bin,
+                                          const char *scratch) {
+  OrcaCConfig cfg;
+  OrcaCConfig moved_cfg;
+  OrcaCSession *s = NULL;
+  char next[4096];
+  char old_root[PATH_MAX + 32];
+  char left_root[PATH_MAX + 32];
+  double e = 3.0;
+  int before = entry_count(scratch);
+
+  snprintf(next, sizeof(next), "%s/next-rb", scratch);
+  snprintf(fail_new_prefix, sizeof(fail_new_prefix), "%s/", next);
+  CHECK(mkdir(next, 0700) == 0, "mkdir next scratch");
+  orcac_config_init(&cfg, sizeof(cfg));
+  cfg.executable = fake_bin;
+  cfg.scratch_dir = scratch;
+  cfg.timeout_s = 30.0;
+  moved_cfg = cfg;
+  moved_cfg.scratch_dir = next;
+  orcac_test_remove_fail = fail_removal;
+
+  CHECK(orcac_create(&cfg, &s, NULL, 0) == ORCAC_OK, "create");
+  if (s == NULL) {
+    orcac_test_remove_fail = NULL;
+    return;
+  }
+  snprintf(old_root, sizeof(old_root), "%s", s->dirs.root);
+  snprintf(fail_old_root, sizeof(fail_old_root), "%s", old_root);
+  fail_new_calls = 0;
+  CHECK(orcac_configure(s, &moved_cfg) == ORCAC_E_ERROR,
+        "configure succeeded with neither tree removable");
+  CHECK(fail_new_calls == 1, "removal of the new tree not attempted");
+  CHECK(s->leftover.root != NULL &&
+            strncmp(s->leftover.root, fail_new_prefix,
+                    strlen(fail_new_prefix)) == 0 &&
+            s->leftover.root_fd >= 0 && s->leftover.parent_fd >= 0,
+        "new tree forgotten after its removal failed");
+  if (s->leftover.root == NULL) {
+    orcac_test_remove_fail = NULL;
+    orcac_destroy(s);
+    remove_by_path(scratch, "next-rb");
+    return;
+  }
+  snprintf(left_root, sizeof(left_root), "%s", s->leftover.root);
+  CHECK(strstr(orcac_last_error(s), old_root) != NULL &&
+            strstr(orcac_last_error(s), left_root) != NULL &&
+            strstr(orcac_last_error(s), strerror(EIO)) != NULL &&
+            strstr(orcac_last_error(s), "kept for the next") != NULL,
+        "failed rollback not reported by configure");
+  CHECK(entry_count(next) == 1 && entry_count(left_root) == 3,
+        "kept new tree not left whole");
+  CHECK(strcmp(s->settings.scratch_dir, scratch) == 0 &&
+            strcmp(s->dirs.root, old_root) == 0,
+        "session moved by a failed configure");
+
+  /* The old tree could go now, but the kept one still cannot. */
+  fail_old_root[0] = '\0';
+  fail_new_calls = 0;
+  CHECK(orcac_configure(s, &moved_cfg) == ORCAC_E_ERROR &&
+            strstr(orcac_last_error(s), left_root) != NULL &&
+            strstr(orcac_last_error(s), "an earlier orcac_configure") != NULL,
+        "kept new tree not retried and reported first");
+  CHECK(fail_new_calls == 1 && entry_count(next) == 1 &&
+            s->leftover.root != NULL &&
+            strcmp(s->leftover.root, left_root) == 0,
+        "kept new tree dropped or another one made");
+  CHECK(access(old_root, F_OK) == 0 &&
+            strcmp(s->settings.scratch_dir, scratch) == 0,
+        "old tree removed while the kept one was still left");
+  CHECK(orcac_energy_gradient(s, 3, kPos, kZ, ORCAC_WANT_ENERGY, &e, NULL,
+                              NULL) == ORCAC_OK,
+        "call while a new tree is kept");
+
+  /* Once it can be removed, the next move clears it and goes ahead. */
+  fail_new_prefix[0] = '\0';
+  CHECK(orcac_configure(s, &moved_cfg) == ORCAC_OK, "configure once removable");
+  CHECK(access(left_root, F_OK) != 0 && access(old_root, F_OK) != 0 &&
+            s->leftover.root == NULL && entry_count(next) == 1,
+        "kept tree or old tree left after the move");
+  orcac_destroy(s);
+  CHECK(orcac_last_error(NULL)[0] == '\0' && entry_count(next) == 0,
+        "destroy after the move");
+
+  /* destroy removes a kept tree, and names it when it cannot. */
+  for (int still_failing = 0; still_failing <= 1; ++still_failing) {
+    s = NULL;
+    CHECK(orcac_create(&cfg, &s, NULL, 0) == ORCAC_OK, "create for destroy");
+    if (s == NULL) {
+      break;
+    }
+    snprintf(fail_old_root, sizeof(fail_old_root), "%s", s->dirs.root);
+    snprintf(fail_new_prefix, sizeof(fail_new_prefix), "%s/", next);
+    CHECK(orcac_configure(s, &moved_cfg) == ORCAC_E_ERROR &&
+              s->leftover.root != NULL,
+          "no kept tree for destroy");
+    snprintf(left_root, sizeof(left_root), "%s",
+             s->leftover.root != NULL ? s->leftover.root : "");
+    fail_old_root[0] = '\0';
+    if (!still_failing) {
+      fail_new_prefix[0] = '\0';
+    }
+    orcac_destroy(s);
+    if (still_failing) {
+      CHECK(strstr(orcac_last_error(NULL), left_root) != NULL &&
+                strstr(orcac_last_error(NULL), strerror(EIO)) != NULL,
+            "destroy did not name the kept tree it could not remove");
+      CHECK(entry_count(next) == 1, "kept tree not left by destroy");
+      fail_new_prefix[0] = '\0';
+      remove_by_path(next, strrchr(left_root, '/') + 1);
+    } else {
+      CHECK(orcac_last_error(NULL)[0] == '\0',
+            "clean destroy with a kept tree left an error");
+    }
+    CHECK(entry_count(next) == 0, "kept tree left after destroy");
+  }
+  orcac_test_remove_fail = NULL;
+  fail_old_root[0] = '\0';
+  fail_new_prefix[0] = '\0';
+  CHECK(rmdir(next) == 0, "remove next scratch");
+  CHECK(entry_count(scratch) == before, "scratch not back to its entries");
+}
+
 static char swap_session_to[PATH_MAX + 32];
 static char swap_decoy_target[PATH_MAX + 32];
 
@@ -1615,6 +1762,7 @@ int main(int argc, char **argv) {
   test_keep_moved_in_window(scratch);
   test_session_alloc_stuck(scratch);
   test_configure_cleanup_fails(fake_bin, scratch);
+  test_configure_rollback_fails(fake_bin, scratch);
   CHECK(entry_count(scratch) == 0, "scratch directory left non-empty");
   rmdir(scratch);
   test_remove_tree();

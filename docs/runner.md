@@ -83,7 +83,13 @@ When `orcac_configure` cannot remove the old tree it returns
 `ORCAC_E_ERROR` with the directory and the reason, removes the new tree
 again and keeps the old settings and the old pinned tree, making
 `run/`, `guess/` and `keep/` again where the failed removal took them;
-only the stored guesses are gone.
+only the stored guesses are gone. If the new tree cannot be removed
+again either, the error names it and the reason as well, and the
+session keeps it pinned instead of forgetting it: the next
+`orcac_configure` with a new `scratch_dir` removes it before anything
+else and, while it still cannot, returns `ORCAC_E_ERROR` naming it and
+changes nothing, and `orcac_destroy` removes it with the session tree
+and names it in `orcac_last_error(NULL)` if it is still left.
 When `orcac_destroy` cannot remove the tree, `orcac_last_error(NULL)`
 names the directory and the reason; after a clean destroy it is empty.
 

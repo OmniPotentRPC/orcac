@@ -74,6 +74,11 @@ static void copy_text(char *dst, size_t dst_n, const char *src) {
   dst[n] = '\0';
 }
 
+static void append_error(OrcaCSession *s, const char *text) {
+  size_t used = strlen(s->last_error);
+  orcac_errf(s->last_error + used, sizeof(s->last_error) - used, "%s", text);
+}
+
 /*
  * Create name in the directory open at dirfd, which must not exist yet
  * and is never followed as a symlink, and write text to it. dir names
@@ -440,6 +445,15 @@ int orcac_configure(OrcaCSession *s, const OrcaCConfig *config) {
   }
   if (strcmp(next.scratch_dir, s->settings.scratch_dir) != 0) {
     OrcacSessionDirs moved;
+    if (orcac_session_remove(&s->leftover, s->last_error,
+                             sizeof(s->last_error)) != 0) {
+      append_error(s, "; an earlier orcac_configure left it, and the "
+                      "session keeps its settings and directory");
+      free_settings(&next);
+      free(exe_copy);
+      st = ORCAC_E_ERROR;
+      goto done;
+    }
     if (orcac_session_open(next.scratch_dir, &moved, s->last_error,
                            sizeof(s->last_error)) != 0) {
       free_settings(&next);
@@ -450,10 +464,16 @@ int orcac_configure(OrcaCSession *s, const OrcaCConfig *config) {
     orcac_cache_clear(&s->guesses, s->dirs.guess_fd);
     if (orcac_session_remove(&s->dirs, s->last_error,
                              sizeof(s->last_error)) != 0) {
-      size_t used = strlen(s->last_error);
-      orcac_errf(s->last_error + used, sizeof(s->last_error) - used,
-                 "; the session keeps its settings and directory");
-      orcac_session_close(&moved, NULL, 0);
+      char undo[ORCAC_LAST_ERROR_SIZE];
+      append_error(s, "; the session keeps its settings and directory");
+      undo[0] = '\0';
+      if (orcac_session_remove(&moved, undo, sizeof(undo)) != 0) {
+        append_error(s, "; ");
+        append_error(s, undo);
+        append_error(s, ", kept for the next orcac_configure with a new "
+                        "scratch_dir or orcac_destroy to remove");
+        s->leftover = moved;
+      }
       free_settings(&next);
       free(exe_copy);
       st = ORCAC_E_ERROR;
@@ -936,7 +956,16 @@ void orcac_destroy(OrcaCSession *s) {
   if (getpid() == s->owner_pid) {
     char err[ORCAC_LAST_ERROR_SIZE];
     err[0] = '\0';
-    if (orcac_session_close(&s->dirs, err, sizeof(err)) != 0) {
+    char left[ORCAC_LAST_ERROR_SIZE];
+    int rc = orcac_session_close(&s->dirs, err, sizeof(err));
+    left[0] = '\0';
+    if (orcac_session_close(&s->leftover, left, sizeof(left)) != 0) {
+      size_t used = strlen(err);
+      orcac_errf(err + used, sizeof(err) - used, "%s%s", rc != 0 ? "; " : "",
+                 left);
+      rc = -1;
+    }
+    if (rc != 0) {
       finish(NULL, NULL, ORCAC_E_ERROR, err);
     } else {
       finish(NULL, NULL, ORCAC_OK, "");
@@ -944,6 +973,7 @@ void orcac_destroy(OrcaCSession *s) {
     pthread_mutex_destroy(&s->lock);
   } else {
     orcac_session_free(&s->dirs);
+    orcac_session_free(&s->leftover);
   }
   orcac_cache_free(&s->guesses);
   free_settings(&s->settings);

@@ -83,6 +83,12 @@ extern void (*orcac_test_after_keep)(int root_fd);
  */
 extern void (*orcac_test_before_keep)(int root_fd, int keep_fd);
 /*
+ * Asked by orcac_session_remove and orcac_session_close before they
+ * remove anything; a nonzero errno value fails the removal with it and
+ * leaves the tree whole.
+ */
+extern int (*orcac_test_remove_fail)(const OrcacSessionDirs *dirs);
+/*
  * Asked by orcac_session_open once the paths are allocated; nonzero
  * takes the out-of-memory path, which removes the new root without
  * allocating.

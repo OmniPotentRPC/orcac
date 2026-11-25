@@ -43,6 +43,11 @@ struct OrcaCSession {
   OrcacSettings settings;
   char *exe;     /* realpath resolved at create or configure */
   OrcacSessionDirs dirs;
+  /*
+   * A new tree that a failed orcac_configure could not remove again;
+   * the next scratch_dir change and orcac_destroy retry it.
+   */
+  OrcacSessionDirs leftover;
   pid_t owner_pid;
   pthread_mutex_t lock;
   atomic_uint cancel_gen;   /* orcac_cancel bumps it */
