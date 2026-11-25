@@ -550,10 +550,30 @@ static void test_make_run_dir(const char *scratch) {
   }
 }
 
-enum { RUN_DIR_CHMOD = 1, RUN_DIR_SYMLINK = 2, RUN_DIR_NO_FDS = 3 };
+enum {
+  RUN_DIR_CHMOD = 1,
+  RUN_DIR_SYMLINK = 2,
+  RUN_DIR_NO_FDS = 3,
+  RUN_DIR_DECOY_NO_FDS = 4
+};
 static int run_dir_mode = 0;
 static const char *run_dir_outside = NULL;
 static struct rlimit run_dir_saved_limit;
+
+/* Leave no descriptor free, so the next open fails with EMFILE. */
+static void use_up_fds(void) {
+  struct rlimit tight;
+  int lowest = dup(STDIN_FILENO);
+  CHECK(lowest >= 0 && getrlimit(RLIMIT_NOFILE, &run_dir_saved_limit) == 0,
+        "query the descriptor limit");
+  if (lowest >= 0) {
+    close(lowest);
+    tight = run_dir_saved_limit;
+    tight.rlim_cur = (rlim_t)lowest;
+    CHECK(setrlimit(RLIMIT_NOFILE, &tight) == 0,
+          "lower the descriptor limit");
+  }
+}
 
 /* Runs between the mkdirat of a session directory and its check. */
 static void run_dir_hook(int parent_fd, const char *name) {
@@ -564,17 +584,12 @@ static void run_dir_hook(int parent_fd, const char *name) {
               symlinkat(run_dir_outside, parent_fd, name) == 0,
           "swap the new directory for a symlink");
   } else if (run_dir_mode == RUN_DIR_NO_FDS) {
-    struct rlimit tight;
-    int lowest = dup(STDIN_FILENO);
-    CHECK(lowest >= 0 && getrlimit(RLIMIT_NOFILE, &run_dir_saved_limit) == 0,
-          "query the descriptor limit");
-    if (lowest >= 0) {
-      close(lowest);
-      tight = run_dir_saved_limit;
-      tight.rlim_cur = (rlim_t)lowest;
-      CHECK(setrlimit(RLIMIT_NOFILE, &tight) == 0,
-            "lower the descriptor limit");
-    }
+    use_up_fds();
+  } else if (run_dir_mode == RUN_DIR_DECOY_NO_FDS) {
+    CHECK(renameat(parent_fd, name, parent_fd, "held") == 0 &&
+              mkdirat(parent_fd, name, 0700) == 0,
+          "swap the new directory for an empty decoy");
+    use_up_fds();
   }
 }
 
@@ -589,7 +604,7 @@ static int make_run_dir_with(int mode, const char *scratch, char *err,
   rc = orcac_make_run_dir(scratch, &parent_fd, &dir_fd, path, sizeof(path),
                           err, err_n);
   orcac_test_run_dir_hook = NULL;
-  if (mode == RUN_DIR_NO_FDS) {
+  if (mode == RUN_DIR_NO_FDS || mode == RUN_DIR_DECOY_NO_FDS) {
     setrlimit(RLIMIT_NOFILE, &run_dir_saved_limit);
   }
   run_dir_mode = 0;
@@ -659,10 +674,29 @@ static void test_session_paths_oom(const char *scratch) {
   CHECK(entry_count(scratch) == before, "scratch not back to its entries");
 }
 
+/* rmdir every orcac-* directory in dir; the number removed. */
+static int remove_session_dirs(const char *dir) {
+  DIR *d = opendir(dir);
+  struct dirent *ent;
+  int removed = 0;
+  while (d != NULL && (ent = readdir(d)) != NULL) {
+    char path[4096];
+    if (run_dir_name_ok(ent->d_name)) {
+      snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
+      removed += rmdir(path) == 0;
+    }
+  }
+  if (d != NULL) {
+    closedir(d);
+  }
+  return removed;
+}
+
 /*
  * A session directory that fails its checks after mkdirat is removed
- * again when it is still the empty directory made, and nothing else
- * under its name is touched.
+ * again when it is still the empty directory that was opened, and
+ * nothing else under its name is touched. One that could not be opened
+ * is left, since nothing identifies it.
  */
 static void test_make_run_dir_discard(const char *scratch) {
   char err[256];
@@ -677,13 +711,22 @@ static void test_make_run_dir_discard(const char *scratch) {
   CHECK(entry_count(scratch) == before,
         "rejected session directory left behind");
 
-  CHECK(make_run_dir_with(RUN_DIR_NO_FDS, scratch, err, sizeof(err)) != 0,
-        "session directory opened without a free descriptor");
-  CHECK(entry_count(scratch) == before,
-        "unopened session directory left behind");
-
   snprintf(outside, sizeof(outside), "%s/outside", scratch);
   snprintf(held, sizeof(held), "%s/held", scratch);
+
+  err[0] = '\0';
+  CHECK(make_run_dir_with(RUN_DIR_NO_FDS, scratch, err, sizeof(err)) != 0 &&
+            strstr(err, "left in place") != NULL,
+        "unopened session directory not reported as left in place");
+  CHECK(entry_count(scratch) == before + 1 && remove_session_dirs(scratch) == 1,
+        "unopened session directory removed by name");
+
+  CHECK(make_run_dir_with(RUN_DIR_DECOY_NO_FDS, scratch, err, sizeof(err)) != 0,
+        "session directory swapped for a decoy accepted");
+  CHECK(entry_count(scratch) == before + 2 && remove_session_dirs(scratch) == 1,
+        "empty decoy in place of an unopened session directory removed");
+  CHECK(rmdir(held) == 0, "remove the held session directory");
+
   CHECK(mkdir(outside, 0700) == 0, "mkdir outside");
   run_dir_outside = "outside";
   CHECK(make_run_dir_with(RUN_DIR_SYMLINK, scratch, err, sizeof(err)) != 0,

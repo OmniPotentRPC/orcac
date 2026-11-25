@@ -38,8 +38,10 @@ int orcac_resolve_executable(const char *requested,
  * relative to it, under a fresh random name while names are taken, and
  * opened through it with O_NOFOLLOW into *dir_fd_out and must be the
  * entry the parent holds, owned by this user and mode 0700. A new
- * directory that fails those checks is removed again while its entry is
- * still that empty directory. run_dir gets its path, for messages only.
+ * directory that was opened but fails those checks is removed again
+ * while its entry is still the opened directory; one that could not be
+ * opened is left in place, and errbuf says so. run_dir gets its path,
+ * for messages only.
  */
 int orcac_make_run_dir(const char *scratch_root,
                        int *parent_fd_out,

@@ -180,20 +180,23 @@ void (*orcac_test_run_dir_hook)(int parent_fd, const char *name) = NULL;
 #endif
 
 /*
- * Undo the mkdirat of name in parent_fd after the new directory failed
- * its checks. With fd open, the entry goes only while it is still that
- * directory. Without it, only an empty directory of this user under the
- * name goes; AT_REMOVEDIR never follows a symlink and never removes a
- * directory that holds anything.
+ * Undo the mkdirat of name in parent_fd after the new directory, open
+ * at fd, failed its checks: the entry goes only while it is still that
+ * directory of this user. With fd < 0 nothing identifies what mkdirat
+ * made, so the entry is left. POSIX has no unlinkat that names an
+ * inode, so a rename in the window between the fstatat and the unlinkat
+ * can still put another empty directory under the name; AT_REMOVEDIR
+ * never follows a symlink and never removes a directory that holds
+ * anything. errno is kept.
  */
 static void discard_run_dir(int parent_fd, const char *name, int fd) {
   int saved = errno;
   struct stat st;
   struct stat entry;
-  if (fstatat(parent_fd, name, &entry, AT_SYMLINK_NOFOLLOW) == 0 &&
+  if (fd >= 0 && fstat(fd, &st) == 0 &&
+      fstatat(parent_fd, name, &entry, AT_SYMLINK_NOFOLLOW) == 0 &&
       S_ISDIR(entry.st_mode) && entry.st_uid == geteuid() &&
-      (fd < 0 || (fstat(fd, &st) == 0 && st.st_dev == entry.st_dev &&
-                  st.st_ino == entry.st_ino))) {
+      st.st_dev == entry.st_dev && st.st_ino == entry.st_ino) {
     unlinkat(parent_fd, name, AT_REMOVEDIR);
   }
   errno = saved;
@@ -265,7 +268,16 @@ int orcac_make_run_dir(const char *scratch_root,
   }
 #endif
   fd = openat(parent_fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-  if (fd < 0 || fstat(fd, &st) != 0 ||
+  if (fd < 0) {
+    orcac_errf(errbuf, errbuf_n,
+               "orcac: could not open new scratch directory %s, left in "
+               "place: %s",
+               run_dir, strerror(errno));
+    close(parent_fd);
+    run_dir[0] = '\0';
+    return -1;
+  }
+  if (fstat(fd, &st) != 0 ||
       fstatat(parent_fd, name, &entry, AT_SYMLINK_NOFOLLOW) != 0 ||
       st.st_dev != entry.st_dev || st.st_ino != entry.st_ino ||
       st.st_uid != geteuid() || (st.st_mode & 077) != 0) {
@@ -273,9 +285,7 @@ int orcac_make_run_dir(const char *scratch_root,
                "orcac: scratch directory %s changed before it was opened",
                run_dir);
     discard_run_dir(parent_fd, name, fd);
-    if (fd >= 0) {
-      close(fd);
-    }
+    close(fd);
     close(parent_fd);
     run_dir[0] = '\0';
     return -1;

@@ -101,8 +101,11 @@ root, by device and inode, and remove nothing with `EXDEV` otherwise.
 The walk that empties the root then treats the pinned parent as the
 top of its chain, so that check is repeated before every descent and
 every unlink, and once more before the root's own entry is removed. A
-new root that fails its checks is
-removed again only while it is still the empty directory that was made.
+new root that was opened but fails its checks is removed again only
+while its entry is still the opened directory of this user. A new root
+that could not be opened at all is left in place and the error says
+so: without a descriptor nothing identifies what `mkdirat` made, and
+removing by name could take an empty directory swapped in under it.
 
 The remover pins a descriptor for every level from the session root
 down. Each level is opened from its pinned parent with
@@ -114,9 +117,16 @@ inode, that its pinned parent holds under the name it was opened by. A
 symlink is unlinked itself and a directory swapped for a symlink during
 the walk is never entered. A directory on another device, or one that
 it or any ancestor was renamed away from, is left in place and reported
-with `EXDEV`. A rename in the window between that check and the
-`unlinkat` still cannot point the `unlinkat` at a different directory.
-It always acts on the pinned directory that was just checked.
+with `EXDEV`.
+
+POSIX has no `unlinkat` that names an inode, so every removal by name
+keeps a short window between its last identity check and the
+`unlinkat`. The `unlinkat` always acts in the pinned parent that was
+just checked, so a rename in that window cannot point it at another
+directory's entries, but someone who can write that parent could swap
+another entry in under the same name. With `AT_REMOVEDIR` that entry
+goes only if it is an empty directory; a symlink or a non-empty
+directory never does.
 
 ## Results
 
