@@ -554,7 +554,8 @@ enum {
   RUN_DIR_CHMOD = 1,
   RUN_DIR_SYMLINK = 2,
   RUN_DIR_NO_FDS = 3,
-  RUN_DIR_DECOY_NO_FDS = 4
+  RUN_DIR_DECOY_NO_FDS = 4,
+  RUN_DIR_NONEMPTY = 5
 };
 static int run_dir_mode = 0;
 static const char *run_dir_outside = NULL;
@@ -590,6 +591,16 @@ static void run_dir_hook(int parent_fd, const char *name) {
               mkdirat(parent_fd, name, 0700) == 0,
           "swap the new directory for an empty decoy");
     use_up_fds();
+  } else if (run_dir_mode == RUN_DIR_NONEMPTY) {
+    int fd = -1;
+    CHECK(renameat(parent_fd, name, parent_fd, "held") == 0 &&
+              mkdirat(parent_fd, name, 0700) == 0 &&
+              (fd = openat(parent_fd, name, O_RDONLY | O_DIRECTORY)) >= 0 &&
+              mkdirat(fd, "planted", 0700) == 0,
+          "swap the new directory for a private one that holds an entry");
+    if (fd >= 0) {
+      close(fd);
+    }
   }
 }
 
@@ -784,6 +795,35 @@ static void test_make_run_dir_discard(const char *scratch) {
     }
   }
   CHECK(rmdir(held) == 0 && rmdir(outside) == 0, "remove held and outside");
+  CHECK(entry_count(scratch) == before, "scratch not back to its entries");
+
+  /* A private directory of this user that already holds entries. */
+  err[0] = '\0';
+  CHECK(make_run_dir_with(RUN_DIR_NONEMPTY, scratch, err, sizeof(err)) != 0 &&
+            strstr(err, "changed before it was opened") != NULL,
+        "non-empty session directory swapped in accepted");
+  CHECK(entry_count(scratch) == before + 2,
+        "non-empty decoy or the held session directory removed");
+  {
+    DIR *d = opendir(scratch);
+    struct dirent *ent;
+    int decoys = 0;
+    while (d != NULL && (ent = readdir(d)) != NULL) {
+      if (run_dir_name_ok(ent->d_name)) {
+        char path[4096];
+        snprintf(path, sizeof(path), "%s/%s/planted", scratch, ent->d_name);
+        CHECK(rmdir(path) == 0, "non-empty decoy touched");
+        snprintf(path, sizeof(path), "%s/%s", scratch, ent->d_name);
+        CHECK(rmdir(path) == 0, "remove the non-empty decoy");
+        ++decoys;
+      }
+    }
+    if (d != NULL) {
+      closedir(d);
+    }
+    CHECK(decoys == 1, "non-empty decoy not left under the session name");
+  }
+  CHECK(rmdir(held) == 0, "remove the held session directory");
   CHECK(entry_count(scratch) == before, "scratch not back to its entries");
 }
 

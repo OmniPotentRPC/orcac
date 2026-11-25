@@ -2,7 +2,6 @@
 #include "orca_runner.h"
 #include "orcac_errbuf.h"
 
-#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -93,74 +92,23 @@ static int entry_is_fd(int dirfd, const char *name, int fd) {
   return ok;
 }
 
-/* 1 when the directory open at fd holds nothing, 0 when it does, else -1. */
-static int dir_is_empty(int fd) {
-  int dup_fd = openat(fd, ".", DIR_FLAGS);
-  DIR *dir;
-  struct dirent *ent;
-  int empty = 1;
-  if (dup_fd < 0) {
-    return -1;
-  }
-  dir = fdopendir(dup_fd);
-  if (dir == NULL) {
-    int saved = errno;
-    close(dup_fd);
-    errno = saved;
-    return -1;
-  }
-  errno = 0;
-  while ((ent = readdir(dir)) != NULL) {
-    if (strcmp(ent->d_name, ".") != 0 && strcmp(ent->d_name, "..") != 0) {
-      empty = 0;
-      break;
-    }
-  }
-  if (ent == NULL && errno != 0) {
-    int saved = errno;
-    closedir(dir);
-    errno = saved;
-    return -1;
-  }
-  closedir(dir);
-  return empty;
-}
-
 /*
  * Open name in dirfd right after this process made it with mkdirat. No
  * POSIX call makes a directory and returns a descriptor on it, so the
- * entry can be swapped in between. What opens is kept only while it is
- * still dirfd's entry, a directory on dirfd's device, owned by this
- * user, without group or other access, and empty; otherwise it is
- * closed, left where it is, and the result is -1 with EIO, or with the
- * error that kept it from being read. An empty private directory of
- * this user swapped in passes those checks, and nothing can tell it
- * from the one made.
+ * entry can be swapped in between. What opens is kept only while
+ * orcac_check_private_dir accepts it, empty; otherwise it is closed,
+ * left where it is, and the result is -1 with EIO, or with the error
+ * that kept it from being read. An empty private directory of this
+ * user swapped in passes those checks, and nothing can tell it from
+ * the one made.
  */
 static int open_new_dir(int dirfd, const char *name) {
-  struct stat parent;
-  struct stat st;
-  int empty;
   int fd = openat(dirfd, name, DIR_FLAGS);
   if (fd < 0) {
     return -1;
   }
-  if (fstat(dirfd, &parent) != 0 || fstat(fd, &st) != 0) {
+  if (orcac_check_private_dir(dirfd, name, fd, 1) != 0) {
     int saved = errno;
-    close(fd);
-    errno = saved;
-    return -1;
-  }
-  if (!S_ISDIR(st.st_mode) || st.st_dev != parent.st_dev ||
-      st.st_uid != geteuid() || (st.st_mode & 077) != 0 ||
-      !entry_is_pin(dirfd, name, &st)) {
-    close(fd);
-    errno = EIO;
-    return -1;
-  }
-  empty = dir_is_empty(fd);
-  if (empty != 1) {
-    int saved = empty < 0 ? errno : EIO;
     close(fd);
     errno = saved;
     return -1;

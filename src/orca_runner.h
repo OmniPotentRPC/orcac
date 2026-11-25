@@ -36,8 +36,8 @@ int orcac_resolve_executable(const char *requested,
  * uses $TMPDIR, then /tmp). The scratch directory is opened first and
  * stays pinned in *parent_fd_out; the new directory is made with mkdirat
  * relative to it, under a fresh random name while names are taken, and
- * opened through it with O_NOFOLLOW into *dir_fd_out and must be the
- * entry the parent holds, owned by this user and mode 0700. A new
+ * opened through it with O_NOFOLLOW into *dir_fd_out and must pass
+ * orcac_check_private_dir, empty. A new
  * directory that was opened but fails those checks is removed again
  * while its entry is still the opened directory; one that could not be
  * opened is left in place, and errbuf says so. run_dir gets its path,
@@ -50,6 +50,16 @@ int orcac_make_run_dir(const char *scratch_root,
                        size_t run_dir_n,
                        char *errbuf,
                        size_t errbuf_n);
+
+/*
+ * 0 while the directory open at fd is name's entry in dirfd, by type,
+ * device and inode, on dirfd's device, owned by this user, without
+ * group or other access and, when need_empty is set, empty. Otherwise
+ * -1 with EIO, or with the error that kept either from being read. fd
+ * is left open either way.
+ */
+int orcac_check_private_dir(int dirfd, const char *name, int fd,
+                            int need_empty);
 
 /*
  * Copy of environ for the child. Unless keep_mpi is set, variables named

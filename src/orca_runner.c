@@ -182,6 +182,69 @@ static void random_suffix(char *out, size_t n, unsigned int attempt) {
 void (*orcac_test_run_dir_hook)(int parent_fd, const char *name) = NULL;
 #endif
 
+/* 1 when the directory open at fd holds nothing, 0 when it does, else -1. */
+static int dir_is_empty(int fd) {
+  int dup_fd = openat(fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  DIR *dir;
+  struct dirent *ent;
+  int empty = 1;
+  if (dup_fd < 0) {
+    return -1;
+  }
+  dir = fdopendir(dup_fd);
+  if (dir == NULL) {
+    int saved = errno;
+    close(dup_fd);
+    errno = saved;
+    return -1;
+  }
+  errno = 0;
+  while ((ent = readdir(dir)) != NULL) {
+    if (strcmp(ent->d_name, ".") != 0 && strcmp(ent->d_name, "..") != 0) {
+      empty = 0;
+      break;
+    }
+  }
+  if (ent == NULL && errno != 0) {
+    int saved = errno;
+    closedir(dir);
+    errno = saved;
+    return -1;
+  }
+  closedir(dir);
+  return empty;
+}
+
+int orcac_check_private_dir(int dirfd, const char *name, int fd,
+                            int need_empty) {
+  struct stat parent;
+  struct stat st;
+  struct stat entry;
+  int empty;
+  if (fstat(dirfd, &parent) != 0 || fstat(fd, &st) != 0) {
+    return -1;
+  }
+  if (!S_ISDIR(st.st_mode) || st.st_dev != parent.st_dev ||
+      st.st_uid != geteuid() || (st.st_mode & 077) != 0 ||
+      fstatat(dirfd, name, &entry, AT_SYMLINK_NOFOLLOW) != 0 ||
+      (entry.st_mode & S_IFMT) != (st.st_mode & S_IFMT) ||
+      entry.st_dev != st.st_dev || entry.st_ino != st.st_ino) {
+    errno = EIO;
+    return -1;
+  }
+  if (!need_empty) {
+    return 0;
+  }
+  empty = dir_is_empty(fd);
+  if (empty != 1) {
+    if (empty == 0) {
+      errno = EIO;
+    }
+    return -1;
+  }
+  return 0;
+}
+
 /*
  * Undo the mkdirat of name in parent_fd after the new directory, open
  * at fd, failed its checks: the entry goes only while it is still that
@@ -214,8 +277,6 @@ int orcac_make_run_dir(const char *scratch_root,
                        size_t errbuf_n) {
   char name[sizeof("orcac-") + ORCAC_RUN_DIR_SUFFIX];
   const char *root = scratch_root;
-  struct stat st;
-  struct stat entry;
   int parent_fd;
   int fd;
   int made = 0;
@@ -280,10 +341,7 @@ int orcac_make_run_dir(const char *scratch_root,
     run_dir[0] = '\0';
     return -1;
   }
-  if (fstat(fd, &st) != 0 ||
-      fstatat(parent_fd, name, &entry, AT_SYMLINK_NOFOLLOW) != 0 ||
-      st.st_dev != entry.st_dev || st.st_ino != entry.st_ino ||
-      st.st_uid != geteuid() || (st.st_mode & 077) != 0) {
+  if (orcac_check_private_dir(parent_fd, name, fd, 1) != 0) {
     orcac_errf(errbuf, errbuf_n,
                "orcac: scratch directory %s changed before it was opened",
                run_dir);
