@@ -4,7 +4,9 @@
 Each binary runs twice: once after setlocale(LC_ALL, "") with LC_ALL
 naming the locale, and once after setlocale(LC_NUMERIC, name) with the
 environment left in C. Exits 77, which meson reports as a skip, when no
-comma-decimal locale is installed.
+comma-decimal locale is installed, unless ORCAC_REQUIRE_COMMA_LOCALE is
+set to anything but "" or "0": then a missing locale, or a locale in
+which no binary ran, fails.
 """
 import argparse
 import locale
@@ -25,6 +27,10 @@ CANDIDATES = (
 )
 
 SKIP = 77
+
+
+def required():
+    return os.environ.get("ORCAC_REQUIRE_COMMA_LOCALE", "") not in ("", "0")
 
 
 def comma_locale():
@@ -50,6 +56,10 @@ def main():
 
     name = comma_locale()
     if name is None:
+        if required():
+            print("FAIL: no comma-decimal locale installed and "
+                  "ORCAC_REQUIRE_COMMA_LOCALE is set")
+            return 1
         print("skip: no comma-decimal locale installed")
         return SKIP
 
@@ -87,6 +97,9 @@ def main():
             else:
                 print("ok   %s" % title)
     print("%d runs in %s, %d failed" % (ran, name, len(failed)))
+    if ran == 0 and required():
+        print("FAIL: every run skipped and ORCAC_REQUIRE_COMMA_LOCALE is set")
+        return 1
     return 1 if failed else 0
 
 
