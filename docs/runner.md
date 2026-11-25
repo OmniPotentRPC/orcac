@@ -83,10 +83,14 @@ The session root is opened with `O_DIRECTORY | O_NOFOLLOW` when it is
 made, and every removal and rename goes through that descriptor rather
 than a path. The remover opens each entry relative to its parent with
 `O_NOFOLLOW`, reads it through `fdopendir` and removes it with
-`unlinkat`. A symlink is unlinked itself, a directory swapped for a
-symlink during the walk is never entered, and a directory on another
-device or moved out of its parent is left in place and reported, so the
-walk cannot leave the session root.
+`unlinkat`. Before each descent and each `unlinkat` it follows `..` from
+the directory it is working in back to the pinned session root and
+compares device and inode at the exact expected depth. A symlink is
+unlinked itself, a directory swapped for a symlink during the walk is
+never entered, and a directory on another device, or one whose parent
+or any further ancestor was moved out of the session tree, is left in
+place and reported with `EXDEV`, so the walk cannot leave the session
+root.
 
 ## Results
 

@@ -512,8 +512,7 @@ void (*orcac_test_remove_hook)(int dirfd, const char *name) = NULL;
 /* Retries when an entry changes type between open and unlink. */
 #define ORCAC_REMOVE_MAX_TRIES 4
 
-static int empty_dir_fd(int fd, const struct stat *self,
-                        const struct stat *parent, int depth);
+static int empty_dir_fd(int fd, const struct stat *root, int level);
 
 static int keep_errno(int first, int now) {
   return first != 0 ? first : now;
@@ -524,19 +523,69 @@ static int is_dot_name(const char *name) {
          (name[1] == '\0' || (name[1] == '.' && name[2] == '\0'));
 }
 
-/*
- * 1 while the directory open at fd still sits directly in the directory
- * described by parent, so a subtree moved elsewhere mid-walk is left
- * alone.
- */
-static int still_below(int fd, const struct stat *parent) {
-  struct stat up;
-  return fstatat(fd, "..", &up, 0) == 0 && up.st_dev == parent->st_dev &&
-         up.st_ino == parent->st_ino;
+static int same_inode(const struct stat *a, const struct stat *b) {
+  return a->st_dev == b->st_dev && a->st_ino == b->st_ino;
 }
 
-static int remove_entry_at(int dirfd, const struct stat *parent,
-                           const char *name, int depth) {
+static void call_remove_hook(int dirfd, const char *name) {
+#ifdef ORCAC_TEST_HOOKS
+  if (orcac_test_remove_hook != NULL) {
+    orcac_test_remove_hook(dirfd, name);
+  }
+#else
+  (void)dirfd;
+  (void)name;
+#endif
+}
+
+/*
+ * 1 while the directory open at fd is exactly level steps below the
+ * pinned root, following ".." through descriptors on the root's device.
+ * Checking the whole chain, not only the parent, means a subtree whose
+ * ancestor was renamed out of the tree mid-walk is no longer touched.
+ * errno is left as it was.
+ */
+static int below_root(int fd, const struct stat *root, int level) {
+  int saved = errno;
+  int cur = fd;
+  int ok = 0;
+  struct stat st;
+  if (level == 0) {
+    ok = fstat(fd, &st) == 0 && same_inode(&st, root);
+    errno = saved;
+    return ok;
+  }
+  for (int hop = 1; hop <= level; ++hop) {
+    int up;
+    if (hop == level) {
+      ok = fstatat(cur, "..", &st, AT_SYMLINK_NOFOLLOW) == 0 &&
+           same_inode(&st, root);
+      break;
+    }
+    up = openat(cur, "..", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (cur != fd) {
+      close(cur);
+    }
+    cur = up;
+    if (cur < 0 || fstat(cur, &st) != 0 || st.st_dev != root->st_dev ||
+        same_inode(&st, root)) {
+      break;
+    }
+  }
+  if (cur >= 0 && cur != fd) {
+    close(cur);
+  }
+  errno = saved;
+  return ok;
+}
+
+/*
+ * Remove name, and everything below it, from the directory open at
+ * dirfd, which sits level steps below root. Every unlink and every
+ * descent is preceded by a fresh below_root check.
+ */
+static int remove_entry_at(int dirfd, const struct stat *root, int level,
+                           const char *name) {
   for (int tries = 0; tries < ORCAC_REMOVE_MAX_TRIES; ++tries) {
     struct stat st;
     int rc;
@@ -550,6 +599,11 @@ static int remove_entry_at(int dirfd, const struct stat *parent,
         return -1;
       }
       /* A file or a symlink: remove the entry itself. */
+      call_remove_hook(dirfd, name);
+      if (!below_root(dirfd, root, level)) {
+        errno = EXDEV;
+        return -1;
+      }
       if (unlinkat(dirfd, name, 0) == 0 || errno == ENOENT) {
         return 0;
       }
@@ -564,23 +618,23 @@ static int remove_entry_at(int dirfd, const struct stat *parent,
       errno = saved;
       return -1;
     }
-    if (st.st_dev != parent->st_dev || depth >= ORCAC_REMOVE_MAX_DEPTH) {
+    if (st.st_dev != root->st_dev || level + 1 > ORCAC_REMOVE_MAX_DEPTH) {
       close(fd);
-      errno = st.st_dev != parent->st_dev ? EXDEV : ELOOP;
+      errno = st.st_dev != root->st_dev ? EXDEV : ELOOP;
       return -1;
     }
-#ifdef ORCAC_TEST_HOOKS
-    if (orcac_test_remove_hook != NULL) {
-      orcac_test_remove_hook(dirfd, name);
-    }
-#endif
-    if (!still_below(fd, parent)) {
+    call_remove_hook(dirfd, name);
+    if (!below_root(fd, root, level + 1)) {
       close(fd);
       errno = EXDEV;
       return -1;
     }
-    rc = empty_dir_fd(fd, &st, parent, depth + 1);
+    rc = empty_dir_fd(fd, root, level + 1);
     if (rc != 0) {
+      return -1;
+    }
+    if (!below_root(dirfd, root, level)) {
+      errno = EXDEV;
       return -1;
     }
     if (unlinkat(dirfd, name, AT_REMOVEDIR) == 0 || errno == ENOENT) {
@@ -596,13 +650,13 @@ static int remove_entry_at(int dirfd, const struct stat *parent,
 }
 
 /*
- * Remove every entry of the directory open at fd, which this closes.
- * Each entry is opened relative to fd with O_NOFOLLOW, so a symlink is
- * unlinked itself and a directory swapped for a symlink is never entered.
- * With parent set, the walk stops once fd no longer sits in parent.
+ * Remove every entry of the directory open at fd, level steps below
+ * root, and close fd. Each entry is opened relative to fd with
+ * O_NOFOLLOW, so a symlink is unlinked itself and a directory swapped
+ * for a symlink is never entered. The walk stops once fd is no longer
+ * where it was below root.
  */
-static int empty_dir_fd(int fd, const struct stat *self,
-                        const struct stat *parent, int depth) {
+static int empty_dir_fd(int fd, const struct stat *root, int level) {
   DIR *dir = fdopendir(fd);
   int first = 0;
   if (dir == NULL) {
@@ -629,11 +683,11 @@ static int empty_dir_fd(int fd, const struct stat *self,
         continue;
       }
       ++seen;
-      if (parent != NULL && !still_below(dirfd(dir), parent)) {
+      if (!below_root(dirfd(dir), root, level)) {
         first = keep_errno(first, EXDEV);
         break;
       }
-      if (remove_entry_at(dirfd(dir), self, ent->d_name, depth) == 0) {
+      if (remove_entry_at(dirfd(dir), root, level, ent->d_name) == 0) {
         ++removed;
       } else {
         first = keep_errno(first, errno);
@@ -665,18 +719,32 @@ int orcac_empty_dir(int dirfd) {
   if (fd < 0) {
     return -1;
   }
-  return empty_dir_fd(fd, &st, NULL, 0);
+  return empty_dir_fd(fd, &st, 0);
 }
 
-int orcac_remove_tree_at(int dirfd, const char *name) {
-  struct stat st;
-  if (dirfd < 0 || name == NULL || name[0] == '\0' || is_dot_name(name) ||
-      strchr(name, '/') != NULL) {
+int orcac_remove_tree_below(int root_fd, int dirfd, int level,
+                            const char *name) {
+  struct stat root;
+  if (root_fd < 0 || dirfd < 0 || level < 0 ||
+      level >= ORCAC_REMOVE_MAX_DEPTH || name == NULL || name[0] == '\0' ||
+      is_dot_name(name) || strchr(name, '/') != NULL) {
     errno = EINVAL;
     return -1;
   }
-  if (fstat(dirfd, &st) != 0) {
+  if (fstat(root_fd, &root) != 0) {
     return -1;
   }
-  return remove_entry_at(dirfd, &st, name, 0);
+  if (!S_ISDIR(root.st_mode)) {
+    errno = ENOTDIR;
+    return -1;
+  }
+  if (!below_root(dirfd, &root, level)) {
+    errno = EXDEV;
+    return -1;
+  }
+  return remove_entry_at(dirfd, &root, level, name);
+}
+
+int orcac_remove_tree_at(int dirfd, const char *name) {
+  return orcac_remove_tree_below(dirfd, dirfd, 0, name);
 }

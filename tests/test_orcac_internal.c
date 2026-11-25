@@ -354,25 +354,68 @@ static int entry_count(const char *dir) {
   return n;
 }
 
-enum { SWAP_FOR_SYMLINK = 1, MOVE_OUT = 2 };
+enum { SWAP_FOR_SYMLINK = 1, MOVE_OUT = 2, MOVE_ANCESTOR = 3 };
 static int swap_mode = 0;
 static int swap_calls = 0;
+static const char *swap_trigger = "a";
+static const char *swap_dest = "moved";
 static char swap_outside[PATH_MAX + 16];
+static char swap_root[PATH_MAX + 16];
 
-/* Runs once the walk holds a descriptor for "a", before emptying it. */
+/*
+ * Runs once the walk reaches swap_trigger: after opening it when it is a
+ * directory, before unlinking it otherwise. MOVE_ANCESTOR renames root/a,
+ * an ancestor of the trigger, out of the tree by path.
+ */
 static void swap_on_open(int dirfd, const char *name) {
+  char from[PATH_MAX + 64];
   char moved[PATH_MAX + 64];
-  if (strcmp(name, "a") != 0 || swap_calls++ != 0) {
+  if (strcmp(name, swap_trigger) != 0 || swap_calls++ != 0) {
     return;
   }
+  snprintf(moved, sizeof(moved), "%s/%s", swap_outside, swap_dest);
   if (swap_mode == SWAP_FOR_SYMLINK) {
     CHECK(renameat(dirfd, "a", dirfd, "a.real") == 0 &&
               symlinkat(swap_outside, dirfd, "a") == 0,
           "swap a for a symlink");
-  } else {
-    snprintf(moved, sizeof(moved), "%s/moved", swap_outside);
+  } else if (swap_mode == MOVE_OUT) {
     CHECK(renameat(dirfd, "a", AT_FDCWD, moved) == 0, "move a out");
+  } else {
+    snprintf(from, sizeof(from), "%s/a", swap_root);
+    CHECK(rename(from, moved) == 0, "move the ancestor a out");
   }
+}
+
+/*
+ * root/a/{f1,f2,b/g}; the hook moves root/a out of the root when the walk
+ * reaches trigger. Returns the remover's result with errno.
+ */
+static int race_ancestor_move(const char *root, const char *trigger,
+                              const char *dest) {
+  char path[PATH_MAX + 64];
+  int fd;
+  int rc;
+  snprintf(path, sizeof(path), "%s/a", root);
+  make_tree(path);
+  swap_mode = MOVE_ANCESTOR;
+  swap_calls = 0;
+  swap_trigger = trigger;
+  swap_dest = dest;
+  orcac_test_remove_hook = swap_on_open;
+  fd = open(root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  errno = 0;
+  rc = fd >= 0 ? orcac_empty_dir(fd) : -1;
+  {
+    int saved = errno;
+    orcac_test_remove_hook = NULL;
+    swap_trigger = "a";
+    swap_dest = "moved";
+    if (fd >= 0) {
+      close(fd);
+    }
+    errno = saved;
+  }
+  return rc;
 }
 
 /*
@@ -405,6 +448,7 @@ static void test_remove_tree(void) {
   snprintf(root, sizeof(root), "%s/root", base);
   snprintf(outside, sizeof(outside), "%s/outside", base);
   snprintf(swap_outside, sizeof(swap_outside), "%s", outside);
+  snprintf(swap_root, sizeof(swap_root), "%s", root);
   make_tree(outside);
   work_fd = open(work, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
   CHECK(work_fd >= 0, "open work");
@@ -469,6 +513,62 @@ static void test_remove_tree(void) {
   snprintf(moved, sizeof(moved), "%s/moved", outside);
   CHECK(tree_intact(moved) && tree_intact(outside),
         "moved-out subtree touched");
+  if (fd >= 0) {
+    close(fd);
+  }
+
+  /*
+   * root/a is renamed out after the walk opened root/a/b: b still sits in
+   * a, so only a check of the whole chain up to the root sees the move.
+   */
+  rc = race_ancestor_move(root, "b", "moved-desc");
+  CHECK(swap_calls == 1, "descent race hook not reached");
+  CHECK(rc != 0 && errno == EXDEV,
+        "walk descended into a subtree whose ancestor moved out");
+  snprintf(moved, sizeof(moved), "%s/moved-desc", outside);
+  CHECK(file_is(moved, "b/g", "g"),
+        "file below a moved-out ancestor deleted on descent");
+  CHECK(tree_intact(outside), "outside tree touched by the descent race");
+
+  /* The same move just before a file in root/a/b is unlinked. */
+  rc = race_ancestor_move(root, "g", "moved-file");
+  CHECK(swap_calls == 1, "unlink race hook not reached");
+  CHECK(rc != 0 && errno == EXDEV,
+        "walk unlinked in a subtree whose ancestor moved out");
+  snprintf(moved, sizeof(moved), "%s/moved-file", outside);
+  CHECK(file_is(moved, "b/g", "g"),
+        "file below a moved-out ancestor unlinked");
+  CHECK(tree_intact(outside), "outside tree touched by the unlink race");
+
+  /* dirfd must sit exactly level steps below root_fd. */
+  snprintf(path, sizeof(path), "%s/a", root);
+  make_tree(path);
+  fd = open(root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  {
+    int a_fd = fd >= 0 ? openat(fd, "a", O_RDONLY | O_DIRECTORY |
+                                             O_NOFOLLOW | O_CLOEXEC)
+                       : -1;
+    int out_fd = open(outside, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    errno = 0;
+    CHECK(a_fd >= 0 && orcac_remove_tree_below(fd, a_fd, 2, "b") != 0 &&
+              errno == EXDEV,
+          "wrong level accepted");
+    errno = 0;
+    CHECK(out_fd >= 0 && orcac_remove_tree_below(fd, out_fd, 1, "b") != 0 &&
+              errno == EXDEV && tree_intact(outside),
+          "directory outside the root accepted");
+    CHECK(a_fd >= 0 && orcac_remove_tree_below(fd, a_fd, 1, "b") == 0 &&
+              file_is(path, "f1", "f1"),
+          "remove a/b below the root");
+    snprintf(moved, sizeof(moved), "%s/b", path);
+    CHECK(access(moved, F_OK) != 0, "a/b left behind");
+    if (a_fd >= 0) {
+      close(a_fd);
+    }
+    if (out_fd >= 0) {
+      close(out_fd);
+    }
+  }
   if (fd >= 0) {
     close(fd);
   }

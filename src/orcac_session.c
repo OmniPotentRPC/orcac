@@ -127,7 +127,7 @@ int orcac_session_keep_run(const OrcacSessionDirs *dirs) {
   if (keep_fd < 0) {
     return -1;
   }
-  if (orcac_remove_tree_at(keep_fd, "failed") != 0) {
+  if (orcac_remove_tree_below(dirs->root_fd, keep_fd, 1, "failed") != 0) {
     close(keep_fd);
     return -1;
   }
