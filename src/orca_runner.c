@@ -126,15 +126,25 @@ int orcac_resolve_executable(const char *requested,
 }
 
 int orcac_make_run_dir(const char *scratch_root,
+                       int *parent_fd_out,
+                       int *dir_fd_out,
                        char *run_dir,
                        size_t run_dir_n,
                        char *errbuf,
                        size_t errbuf_n) {
   char pattern[4096];
   const char *root = scratch_root;
-  if (run_dir == NULL || run_dir_n == 0) {
+  const char *name;
+  struct stat st;
+  struct stat entry;
+  int parent_fd;
+  int fd;
+  if (run_dir == NULL || run_dir_n == 0 || parent_fd_out == NULL ||
+      dir_fd_out == NULL) {
     return -1;
   }
+  *parent_fd_out = -1;
+  *dir_fd_out = -1;
   if (root == NULL || root[0] == '\0') {
     root = getenv("TMPDIR");
     if (root == NULL || root[0] == '\0') {
@@ -142,21 +152,46 @@ int orcac_make_run_dir(const char *scratch_root,
     }
   }
   if (snprintf(pattern, sizeof(pattern), "%s/orcac-XXXXXX", root) >=
-      (int)sizeof(pattern)) {
+          (int)sizeof(pattern) ||
+      strlen(pattern) >= run_dir_n) {
     orcac_errf(errbuf, errbuf_n, "orcac: scratch directory path too long");
+    return -1;
+  }
+  parent_fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (parent_fd < 0) {
+    orcac_errf(errbuf, errbuf_n, "orcac: could not open scratch directory "
+               "%s: %s", root, strerror(errno));
     return -1;
   }
   if (mkdtemp(pattern) == NULL) {
     orcac_errf(errbuf, errbuf_n,
                "orcac: could not create scratch directory: %s",
                strerror(errno));
+    close(parent_fd);
     return -1;
   }
-  if (copy_path(run_dir, run_dir_n, pattern) != 0) {
-    rmdir(pattern);
-    orcac_errf(errbuf, errbuf_n, "orcac: scratch directory path too long");
+  name = strrchr(pattern, '/') + 1;
+  /*
+   * mkdtemp works by path, so check that the entry the pinned parent
+   * holds is the private directory it made and not one swapped in.
+   */
+  fd = openat(parent_fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (fd < 0 || fstat(fd, &st) != 0 ||
+      fstatat(parent_fd, name, &entry, AT_SYMLINK_NOFOLLOW) != 0 ||
+      st.st_dev != entry.st_dev || st.st_ino != entry.st_ino ||
+      st.st_uid != geteuid() || (st.st_mode & 077) != 0) {
+    orcac_errf(errbuf, errbuf_n,
+               "orcac: scratch directory %s changed before it was opened",
+               pattern);
+    if (fd >= 0) {
+      close(fd);
+    }
+    close(parent_fd);
     return -1;
   }
+  copy_path(run_dir, run_dir_n, pattern);
+  *parent_fd_out = parent_fd;
+  *dir_fd_out = fd;
   return 0;
 }
 
@@ -370,10 +405,10 @@ void orcac_free_child_env(char **envp) {
 }
 
 int orcac_run_orca(const char *executable,
-                   const char *run_dir,
+                   int run_fd,
                    const char *input_name,
-                   const char *stdout_path,
-                   const char *stderr_path,
+                   const char *stdout_name,
+                   const char *stderr_name,
                    const OrcacRunOptions *options,
                    OrcacChildResult *result,
                    char *errbuf,
@@ -388,18 +423,20 @@ int orcac_run_orca(const char *executable,
   int state = CHILD_RUNNING;
   int rc;
 
-  if (executable == NULL || run_dir == NULL || input_name == NULL ||
-      stdout_path == NULL || stderr_path == NULL || options == NULL ||
+  if (executable == NULL || run_fd < 0 || input_name == NULL ||
+      stdout_name == NULL || stderr_name == NULL || options == NULL ||
       result == NULL) {
     orcac_errf(errbuf, errbuf_n, "orcac: invalid runner arguments");
     return -1;
   }
   memset(result, 0, sizeof(*result));
 
-  out_fd = lift_fd(
-      open(stdout_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644));
-  err_fd = lift_fd(
-      open(stderr_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644));
+  out_fd = lift_fd(openat(run_fd, stdout_name,
+                          O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                          0600));
+  err_fd = lift_fd(openat(run_fd, stderr_name,
+                          O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                          0600));
   null_fd = lift_fd(open("/dev/null", O_RDONLY | O_CLOEXEC));
   if (out_fd < 0 || err_fd < 0 || null_fd < 0) {
     int saved = errno;
@@ -430,7 +467,7 @@ int orcac_run_orca(const char *executable,
   if (pid == 0) {
     char *argv[3];
     setpgid(0, 0);
-    if (chdir(run_dir) != 0 || dup2(null_fd, STDIN_FILENO) < 0 ||
+    if (fchdir(run_fd) != 0 || dup2(null_fd, STDIN_FILENO) < 0 ||
         dup2(out_fd, STDOUT_FILENO) < 0 || dup2(err_fd, STDERR_FILENO) < 0) {
       _exit(126);
     }

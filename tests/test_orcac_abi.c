@@ -939,6 +939,52 @@ static void test_malformed_output(void) {
 }
 
 /*
+ * Output files ORCA leaves as symlinks are not followed: a .gbw link to
+ * a file outside the session is never stored as a guess, and an .engrad
+ * link, even to a valid file, is not read.
+ */
+static void test_output_symlinks(void) {
+  OrcaCConfig cfg = base_config();
+  OrcaCSession *s;
+  OrcaCResult meta;
+  char *secret = join(work, "secret.gbw");
+  char *engrad = join(getenv("ORCAC_FAKE_REPLAY"), "replay.engrad");
+  double e = 0.0;
+  double g[9];
+  FILE *fp = fopen(secret, "wb");
+  CHECK(fp != NULL, "write secret.gbw");
+  if (fp != NULL) {
+    fputs("secret", fp);
+    fclose(fp);
+  }
+  cfg.guess_policy = ORCAC_GUESS_CHAIN;
+  s = make(&cfg);
+  CHECK(s != NULL, "create for output symlinks");
+  if (s != NULL) {
+    setenv("ORCAC_FAKE_GBW_LINK", secret, 1);
+    CHECK(replay_ok(eval(s, &e, g, &meta), &e, g), "run with a .gbw symlink");
+    unsetenv("ORCAC_FAKE_GBW_LINK");
+    CHECK(replay_ok(eval(s, &e, g, &meta), &e, g) && meta.used_guess == 0,
+          "guess stored through a .gbw symlink");
+    CHECK(replay_ok(eval(s, &e, g, &meta), &e, g) && meta.used_guess == 1,
+          "guess from a regular .gbw not used");
+    setenv("ORCAC_FAKE_ENGRAD_LINK", engrad, 1);
+    expect_eval(s, ORCAC_E_ERROR, "engrad left as a symlink", "orcac.engrad");
+    unsetenv("ORCAC_FAKE_ENGRAD_LINK");
+    orcac_destroy(s);
+  }
+  {
+    char *text = slurp(secret);
+    CHECK(text != NULL && strcmp(text, "secret") == 0,
+          "symlink target changed");
+    free(text);
+  }
+  unlink(secret);
+  free(secret);
+  free(engrad);
+}
+
+/*
  * A deck comment in blocks holding the banner is echoed by ORCA; with no
  * real banner after the echo the exit-0 run must still fail.
  */
@@ -1351,6 +1397,7 @@ int main(int argc, char **argv) {
   test_guess_key();
   test_malformed_output();
   test_banner_in_blocks();
+  test_output_symlinks();
   test_fd_hygiene();
   test_reaped_elsewhere();
   test_mpi_env();

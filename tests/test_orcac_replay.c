@@ -625,7 +625,25 @@ int main(int argc, char **argv) {
     if (check_replay(st, &meta, e, g) != 0) {
       return 1;
     }
+    /* destroy cannot remove a tree it cannot empty, and says so. */
+    setenv("ORCAC_FAKE_LOCKED", "1", 1);
+    st = eval(pot, &e, g, &meta);
+    unsetenv("ORCAC_FAKE_LOCKED");
+    if (check_replay(st, &meta, e, g) != 0) {
+      return 1;
+    }
     orcac_destroy(pot);
+    if (strstr(orcac_last_error(NULL),
+               "could not remove session directory") == NULL ||
+        strstr(orcac_last_error(NULL), session) == NULL ||
+        access(locked, F_OK) != 0) {
+      fprintf(stderr, "after destroy: %s\n", orcac_last_error(NULL));
+      return fail("destroy left the session without reporting it");
+    }
+    chmod(locked, 0700);
+    if (remove_tree(session) != 0) {
+      return fail("could not clean up the session destroy left");
+    }
     free(locked);
     free(session);
   }

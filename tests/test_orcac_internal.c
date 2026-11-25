@@ -11,6 +11,7 @@
 #include "orca_runner.h"
 #include "orcac_cache.h"
 #include "orcac_internal.h"
+#include "orcac_session.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -191,57 +192,59 @@ static void test_cache_eviction(const char *dir) {
   char gbw[4096];
   int slot_of[6];
   int slot;
+  int dir_fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 
+  CHECK(dir_fd >= 0, "open cache directory");
   snprintf(gbw, sizeof(gbw), "%s/source.gbw", dir);
   orcac_cache_init(&cache);
   for (int i = 0; i < 4; ++i) {
     write_file(gbw, keys[i]);
-    slot_of[i] = orcac_cache_store(&cache, dir, gbw, keys[i], 3, kZ);
+    slot_of[i] = orcac_cache_store(&cache, dir_fd, dir_fd, "source.gbw", keys[i], 3, kZ);
     CHECK(slot_of[i] >= 0, "store into a free slot");
   }
   for (int i = 0; i < 4; ++i) {
-    CHECK(orcac_cache_lookup(&cache, dir, keys[i], 3, kZ) == slot_of[i],
+    CHECK(orcac_cache_lookup(&cache, dir_fd, keys[i], 3, kZ) == slot_of[i],
           "lookup of a stored key");
     CHECK(slot_holds(dir, slot_of[i], keys[i]), "slot file content");
   }
   {
     int other[3] = {8, 1, 9};
-    CHECK(orcac_cache_lookup(&cache, dir, "A", 3, other) < 0,
+    CHECK(orcac_cache_lookup(&cache, dir_fd, "A", 3, other) < 0,
           "lookup with another composition");
-    CHECK(orcac_cache_lookup(&cache, dir, "Z", 3, kZ) < 0,
+    CHECK(orcac_cache_lookup(&cache, dir_fd, "Z", 3, kZ) < 0,
           "lookup of an unknown key");
   }
 
   write_file(gbw, "B2");
-  slot = orcac_cache_store(&cache, dir, gbw, "B", 3, kZ);
+  slot = orcac_cache_store(&cache, dir_fd, dir_fd, "source.gbw", "B", 3, kZ);
   CHECK(slot == slot_of[1] && slot_holds(dir, slot, "B2"),
         "storing a key again must reuse its slot");
 
   write_file(gbw, "E");
-  slot_of[4] = orcac_cache_store(&cache, dir, gbw, "E", 3, kZ);
+  slot_of[4] = orcac_cache_store(&cache, dir_fd, dir_fd, "source.gbw", "E", 3, kZ);
   CHECK(slot_of[4] == slot_of[0], "E must evict A, the oldest store");
-  CHECK(orcac_cache_lookup(&cache, dir, "A", 3, kZ) < 0, "A still found");
-  CHECK(orcac_cache_lookup(&cache, dir, "B", 3, kZ) == slot_of[1],
+  CHECK(orcac_cache_lookup(&cache, dir_fd, "A", 3, kZ) < 0, "A still found");
+  CHECK(orcac_cache_lookup(&cache, dir_fd, "B", 3, kZ) == slot_of[1],
         "refreshed B was evicted");
   CHECK(slot_holds(dir, slot_of[4], "E"), "evicted slot holds E");
 
   write_file(gbw, "F");
-  slot_of[5] = orcac_cache_store(&cache, dir, gbw, "F", 3, kZ);
+  slot_of[5] = orcac_cache_store(&cache, dir_fd, dir_fd, "source.gbw", "F", 3, kZ);
   CHECK(slot_of[5] == slot_of[2], "F must evict C, next oldest");
-  CHECK(orcac_cache_lookup(&cache, dir, "C", 3, kZ) < 0, "C still found");
-  CHECK(orcac_cache_lookup(&cache, dir, "B", 3, kZ) == slot_of[1] &&
-            orcac_cache_lookup(&cache, dir, "D", 3, kZ) == slot_of[3] &&
-            orcac_cache_lookup(&cache, dir, "E", 3, kZ) == slot_of[4] &&
-            orcac_cache_lookup(&cache, dir, "F", 3, kZ) == slot_of[5],
+  CHECK(orcac_cache_lookup(&cache, dir_fd, "C", 3, kZ) < 0, "C still found");
+  CHECK(orcac_cache_lookup(&cache, dir_fd, "B", 3, kZ) == slot_of[1] &&
+            orcac_cache_lookup(&cache, dir_fd, "D", 3, kZ) == slot_of[3] &&
+            orcac_cache_lookup(&cache, dir_fd, "E", 3, kZ) == slot_of[4] &&
+            orcac_cache_lookup(&cache, dir_fd, "F", 3, kZ) == slot_of[5],
         "survivors after two evictions");
 
   write_file(gbw, "A");
-  slot = orcac_cache_store(&cache, dir, gbw, "A", 3, kZ);
+  slot = orcac_cache_store(&cache, dir_fd, dir_fd, "source.gbw", "A", 3, kZ);
   CHECK(slot == slot_of[3], "A must now evict D, stored before B again");
-  CHECK(orcac_cache_lookup(&cache, dir, "B", 3, kZ) == slot_of[1],
+  CHECK(orcac_cache_lookup(&cache, dir_fd, "B", 3, kZ) == slot_of[1],
         "B evicted out of order");
 
-  orcac_cache_clear(&cache, dir);
+  orcac_cache_clear(&cache, dir_fd);
   for (int i = 0; i < ORCAC_GUESS_SLOTS; ++i) {
     char name[ORCAC_GUESS_NAME_SIZE];
     char path[4096];
@@ -251,6 +254,9 @@ static void test_cache_eviction(const char *dir) {
   }
   orcac_cache_free(&cache);
   unlink(gbw);
+  if (dir_fd >= 0) {
+    close(dir_fd);
+  }
 }
 
 static int hook_calls = 0;
@@ -619,6 +625,149 @@ static void test_remove_tree(void) {
   CHECK(rmdir(work) == 0, "work directory left non-empty");
 }
 
+static char swap_session_to[PATH_MAX + 32];
+static char swap_decoy_target[PATH_MAX + 32];
+
+/*
+ * With the call holding the lock, rename the session root away and put a
+ * decoy in its place, as anyone who can write the scratch directory
+ * could: decoy/run/orcac.inp holds "precious" and decoy/run/orcac.out
+ * links to swap_decoy_target. A path-based run would write through them.
+ */
+static void swap_root_for_decoy(OrcaCSession *s) {
+  char path[PATH_MAX + 64];
+  ++hook_calls;
+  CHECK(rename(s->dirs.root, swap_session_to) == 0, "move the session root");
+  CHECK(mkdir(s->dirs.root, 0700) == 0, "mkdir decoy root");
+  CHECK(mkdir(s->dirs.run, 0700) == 0, "mkdir decoy run");
+  snprintf(path, sizeof(path), "%s/orcac.inp", s->dirs.run);
+  write_file(path, "precious");
+  snprintf(path, sizeof(path), "%s/orcac.out", s->dirs.run);
+  CHECK(symlink(swap_decoy_target, path) == 0, "plant decoy orcac.out");
+}
+
+static int keep_hook_calls = 0;
+
+/* run/ has just moved to keep/failed; make recreating it fail. */
+static void lock_root_after_keep(int root_fd) {
+  ++keep_hook_calls;
+  CHECK(fchmod(root_fd, 0500) == 0, "lock the session root");
+}
+
+/*
+ * The run files go through descriptors pinned when the session and its
+ * run/ were made, so replacing the root beneath the scratch directory
+ * mid-call redirects and truncates nothing; the call still succeeds in
+ * the real tree, and destroy reports the root it can no longer remove.
+ * Then a failed run whose run/ cannot be recreated after it moved to
+ * keep/failed still names the kept files.
+ */
+static void test_pinned_run_files(const char *fake_bin, const char *scratch) {
+  OrcaCConfig cfg;
+  OrcaCSession *s = NULL;
+  OrcaCResult meta;
+  char decoy_inp[PATH_MAX + 64];
+  char decoy_out[PATH_MAX + 64];
+  char root_copy[PATH_MAX + 32];
+  char run_copy[PATH_MAX + 32];
+  double e = 3.0;
+  int st;
+
+  snprintf(swap_session_to, sizeof(swap_session_to), "%s/moved-root",
+           scratch);
+  snprintf(swap_decoy_target, sizeof(swap_decoy_target), "%s/target",
+           scratch);
+  write_file(swap_decoy_target, "target");
+  orcac_config_init(&cfg, sizeof(cfg));
+  cfg.executable = fake_bin;
+  cfg.scratch_dir = scratch;
+  cfg.timeout_s = 30.0;
+  CHECK(orcac_create(&cfg, &s, NULL, 0) == ORCAC_OK, "create");
+  if (s == NULL) {
+    return;
+  }
+  snprintf(root_copy, sizeof(root_copy), "%s", s->dirs.root);
+  snprintf(run_copy, sizeof(run_copy), "%s", s->dirs.run);
+  snprintf(decoy_inp, sizeof(decoy_inp), "%s/orcac.inp", run_copy);
+  snprintf(decoy_out, sizeof(decoy_out), "%s/orcac.out", run_copy);
+  hook_calls = 0;
+  memset(&meta, 0, sizeof(meta));
+  meta.struct_size = sizeof(meta);
+  orcac_test_after_lock = swap_root_for_decoy;
+  st = orcac_energy_gradient(s, 3, kPos, kZ, ORCAC_WANT_ENERGY, &e, NULL,
+                             &meta);
+  orcac_test_after_lock = NULL;
+  CHECK(hook_calls == 1, "root swap hook not called");
+  CHECK(st == ORCAC_OK && fabs(e + 75.5) < 1e-12,
+        "call after the root was swapped did not run in the real tree");
+  CHECK(file_is(run_copy, "orcac.inp", "precious"),
+        "decoy orcac.inp written through the swapped root");
+  CHECK(file_is(scratch, "target", "target"),
+        "orcac.out symlink in the decoy followed");
+  CHECK(entry_count(run_copy) == 2, "files created in the decoy run/");
+  orcac_destroy(s);
+  CHECK(strstr(orcac_last_error(NULL), "could not remove session directory") !=
+            NULL,
+        "destroy did not report the root it could not remove");
+  CHECK(file_is(run_copy, "orcac.inp", "precious") &&
+            file_is(scratch, "target", "target"),
+        "destroy touched the decoy");
+  CHECK(entry_count(swap_session_to) == 0,
+        "real session tree not emptied by destroy");
+  unlink(decoy_inp);
+  unlink(decoy_out);
+  rmdir(run_copy);
+  rmdir(root_copy);
+  rmdir(swap_session_to);
+  unlink(swap_decoy_target);
+
+  /* An empty directory swapped in for the root is not removed either. */
+  CHECK(orcac_create(&cfg, &s, NULL, 0) == ORCAC_OK, "create for empty decoy");
+  if (s == NULL) {
+    return;
+  }
+  snprintf(root_copy, sizeof(root_copy), "%s", s->dirs.root);
+  CHECK(rename(root_copy, swap_session_to) == 0 && mkdir(root_copy, 0700) == 0,
+        "swap the root for an empty directory");
+  orcac_destroy(s);
+  CHECK(access(root_copy, F_OK) == 0 &&
+            strstr(orcac_last_error(NULL), "could not remove") != NULL,
+        "destroy removed an empty directory swapped in for the root");
+  CHECK(entry_count(swap_session_to) == 0, "moved session tree not emptied");
+  rmdir(root_copy);
+  rmdir(swap_session_to);
+
+  if (geteuid() == 0) {
+    return;
+  }
+  CHECK(orcac_create(&cfg, &s, NULL, 0) == ORCAC_OK, "create for keep");
+  if (s == NULL) {
+    return;
+  }
+  setenv("ORCAC_FAKE_FAIL", "3", 1);
+  keep_hook_calls = 0;
+  orcac_test_after_keep = lock_root_after_keep;
+  st = orcac_energy_gradient(s, 3, kPos, kZ, ORCAC_WANT_ENERGY, &e, NULL,
+                             NULL);
+  orcac_test_after_keep = NULL;
+  unsetenv("ORCAC_FAKE_FAIL");
+  CHECK(keep_hook_calls == 1, "keep hook not called");
+  CHECK(st == ORCAC_E_ERROR &&
+            strstr(orcac_last_error(s), "run files kept in") != NULL,
+        "kept run not named when run/ could not be recreated");
+  st = orcac_energy_gradient(s, 3, kPos, kZ, ORCAC_WANT_ENERGY, &e, NULL,
+                             NULL);
+  CHECK(st == ORCAC_E_ERROR &&
+            strstr(orcac_last_error(s), "could not empty") != NULL,
+        "missing run/ not reported by the next call");
+  CHECK(chmod(s->dirs.root, 0700) == 0, "unlock the session root");
+  st = orcac_energy_gradient(s, 3, kPos, kZ, ORCAC_WANT_ENERGY, &e, NULL,
+                             NULL);
+  CHECK(st == ORCAC_OK, "call after run/ could be made again");
+  orcac_destroy(s);
+  CHECK(orcac_last_error(NULL)[0] == '\0', "clean destroy left an error");
+}
+
 int main(int argc, char **argv) {
   char fake_bin[4096];
   char replay[4096];
@@ -638,6 +787,8 @@ int main(int argc, char **argv) {
   }
   test_cache_eviction(scratch);
   test_cancel_window(fake_bin, scratch);
+  test_pinned_run_files(fake_bin, scratch);
+  CHECK(entry_count(scratch) == 0, "scratch directory left non-empty");
   rmdir(scratch);
   test_remove_tree();
 

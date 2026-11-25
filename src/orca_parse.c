@@ -3,11 +3,15 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 static char *dup_text(const char *text) {
   size_t n;
@@ -33,81 +37,97 @@ void orcac_free_engrad(OrcacEngrad *parsed) {
   memset(parsed, 0, sizeof(*parsed));
 }
 
-int orcac_read_file(const char *path, char **text_out) {
-  FILE *fp;
-  long size;
+/*
+ * Open name relative to dirfd for reading, refusing a final symlink and
+ * anything but a regular file. O_NONBLOCK keeps a FIFO planted under the
+ * name from blocking the open; it does nothing for a regular file.
+ */
+static int open_regular_at(int dirfd, const char *name, struct stat *st) {
+  int fd = openat(dirfd, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+  if (fd < 0) {
+    return -1;
+  }
+  if (fstat(fd, st) != 0 || !S_ISREG(st->st_mode)) {
+    close(fd);
+    errno = EINVAL;
+    return -1;
+  }
+  return fd;
+}
+
+/* Up to n bytes from fd into buf; returns the count read. */
+static size_t read_up_to(int fd, char *buf, size_t n) {
+  size_t got = 0;
+  while (got < n) {
+    ssize_t r = read(fd, buf + got, n - got);
+    if (r < 0 && errno == EINTR) {
+      continue;
+    }
+    if (r <= 0) {
+      break;
+    }
+    got += (size_t)r;
+  }
+  return got;
+}
+
+int orcac_read_file_at(int dirfd, const char *name, char **text_out) {
+  struct stat st;
   char *text;
-  size_t got;
-  if (path == NULL || text_out == NULL) {
+  int fd;
+  if (name == NULL || text_out == NULL) {
     return -1;
   }
-  fp = fopen(path, "rb");
-  if (fp == NULL) {
+  fd = open_regular_at(dirfd, name, &st);
+  if (fd < 0) {
     return -1;
   }
-  if (fseek(fp, 0, SEEK_END) != 0) {
-    fclose(fp);
-    return -1;
-  }
-  size = ftell(fp);
-  if (size < 0) {
-    fclose(fp);
-    return -1;
-  }
-  if (fseek(fp, 0, SEEK_SET) != 0) {
-    fclose(fp);
-    return -1;
-  }
-  text = (char *)malloc((size_t)size + 1u);
+  text = (char *)malloc((size_t)st.st_size + 1u);
   if (text == NULL) {
-    fclose(fp);
+    close(fd);
     return -1;
   }
-  got = fread(text, 1u, (size_t)size, fp);
-  fclose(fp);
-  text[got] = '\0';
+  text[read_up_to(fd, text, (size_t)st.st_size)] = '\0';
+  close(fd);
   *text_out = text;
   return 0;
 }
 
-char *orcac_file_tail(const char *path, size_t max_bytes) {
-  FILE *fp;
-  long size;
-  long keep;
+int orcac_read_file(const char *path, char **text_out) {
+  return orcac_read_file_at(AT_FDCWD, path, text_out);
+}
+
+char *orcac_file_tail_at(int dirfd, const char *name, size_t max_bytes) {
+  struct stat st;
+  off_t keep;
   char *text;
-  size_t got;
-  if (path == NULL) {
+  int fd;
+  if (name == NULL) {
     return dup_text("(no path)");
   }
-  fp = fopen(path, "rb");
-  if (fp == NULL) {
+  fd = open_regular_at(dirfd, name, &st);
+  if (fd < 0) {
     return dup_text("(missing)");
   }
-  if (fseek(fp, 0, SEEK_END) != 0) {
-    fclose(fp);
-    return dup_text("(unreadable)");
-  }
-  size = ftell(fp);
-  if (size <= 0) {
-    fclose(fp);
+  if (st.st_size <= 0) {
+    close(fd);
     return dup_text("(empty)");
   }
-  keep = (long)max_bytes;
-  if (keep <= 0 || keep > size) {
-    keep = size;
+  keep = (off_t)max_bytes;
+  if (keep <= 0 || keep > st.st_size) {
+    keep = st.st_size;
   }
-  if (fseek(fp, size - keep, SEEK_SET) != 0) {
-    fclose(fp);
+  if (lseek(fd, st.st_size - keep, SEEK_SET) < 0) {
+    close(fd);
     return dup_text("(unreadable)");
   }
   text = (char *)malloc((size_t)keep + 1u);
   if (text == NULL) {
-    fclose(fp);
+    close(fd);
     return dup_text("(oom)");
   }
-  got = fread(text, 1u, (size_t)keep, fp);
-  fclose(fp);
-  text[got] = '\0';
+  text[read_up_to(fd, text, (size_t)keep)] = '\0';
+  close(fd);
   return text;
 }
 

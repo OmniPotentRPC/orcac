@@ -249,6 +249,8 @@ ORCAC_API const char *orcac_last_error(const OrcaCSession *session);
  * Remove the run directory and free session. NULL is a no-op. In a
  * forked child only the memory is freed; the run directory belongs to
  * the creating process. Must not race with another call on session.
+ * Afterwards orcac_last_error(NULL) is "" when the directory was
+ * removed, else it names what was left behind.
  */
 ORCAC_API void orcac_destroy(OrcaCSession *session);
 

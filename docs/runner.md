@@ -72,16 +72,30 @@ ORCA always starts in an empty `run/`, so it cannot pick up files of an
 earlier attempt, such as a `.gbw` its automatic restart would read. The
 chosen guess slot is copied in before the run. A successful run's files
 are removed; a failed one is moved to `keep/failed` and its path is
-named in the error text, ahead of the output tails. If `run/` cannot be
+named in the error text, ahead of the output tails, even when `run/`
+cannot be made again right after the move. If `run/` cannot be
 emptied after a success, the call still returns `ORCAC_OK` with an empty
 message, as the header promises; the next attempt must empty `run/`
 before ORCA starts and names both failures if it cannot.
 `orcac_configure` with a new `scratch_dir` and `orcac_destroy` remove the
 whole session; a forked child's `orcac_destroy` leaves it to the owner.
+When `orcac_destroy` cannot remove the tree, `orcac_last_error(NULL)`
+names the directory and the reason; after a clean destroy it is empty.
 
-The session root is opened with `O_DIRECTORY | O_NOFOLLOW` when it is
-made, and every removal and rename goes through that descriptor rather
-than a path. The remover opens each entry relative to its parent with
+Nothing in the session is reached by path. The scratch directory is
+opened first and stays pinned; `mkdtemp` makes the root, which is then
+opened through the pinned parent with `O_DIRECTORY | O_NOFOLLOW` and
+must be that entry, owned by the caller and mode 0700. `run/` and
+`guess/` are pinned the same way, and `run/` again each time it is
+recreated. The deck and ORCA's stdout and stderr are created with
+`openat(..., O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC)` in the pinned
+`run/`, ORCA starts there through `fchdir`, and its outputs, the `.gbw`
+stored as a guess included, are read with `O_NOFOLLOW` and must be
+regular files. Guess slots are copied, renamed and removed relative to
+`guess/`. Replacing the root or any directory above it in a writable
+scratch directory therefore cannot redirect or truncate a file, and
+`orcac_destroy` removes the root's entry from the pinned parent only
+while that entry is still the pinned root. The remover opens each entry relative to its parent with
 `O_NOFOLLOW`, reads it through `fdopendir` and removes it with
 `unlinkat`. Before each descent and each `unlinkat` it follows `..` from
 the directory it is working in back to the pinned session root and
@@ -136,9 +150,13 @@ The tests use a shell stand-in for ORCA and synthetic, hand-written
 fixtures; no ORCA output is stored in the repository. They check
 cancel, timeouts, descriptor hygiene, a child reaped by another waiter,
 the MPI scrub, the session layout and kept failures, symlink escape
-including a directory swapped for a symlink during removal, the owner
+including a directory swapped for a symlink during removal, an ancestor
+renamed out of the tree just before a descent or an unlink, a directory
+that keeps refilling, the session root swapped for a decoy mid-call and
+before destroy, `.gbw` and `.engrad` outputs left as symlinks, the owner
 pid check, unconverged-SCF detection with banners echoed from the
-input, the guess key, the MORead
+input, the termination banner echoed from `blocks` on both the exit-0
+and the lost-status paths, the guess key, the MORead
 retry and malformed engrad files, and CI runs them under ASan and UBSan
 with gcc and clang.
 

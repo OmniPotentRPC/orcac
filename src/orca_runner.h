@@ -31,7 +31,17 @@ int orcac_resolve_executable(const char *requested,
                              char *errbuf,
                              size_t errbuf_n);
 
+/*
+ * Make a private orcac-XXXXXX directory under scratch_root (NULL or ""
+ * uses $TMPDIR, then /tmp). The scratch directory is opened first and
+ * stays pinned in *parent_fd_out; the new directory is opened through it
+ * with O_NOFOLLOW into *dir_fd_out and must be the entry the parent
+ * holds, owned by this user and mode 0700. run_dir gets its path, for
+ * messages only.
+ */
 int orcac_make_run_dir(const char *scratch_root,
+                       int *parent_fd_out,
+                       int *dir_fd_out,
                        char *run_dir,
                        size_t run_dir_n,
                        char *errbuf,
@@ -46,8 +56,10 @@ char **orcac_child_env(int keep_mpi);
 void orcac_free_child_env(char **envp);
 
 /*
- * Run executable input_name in run_dir, in a new process group, with
- * stdin from /dev/null, stdout and stderr in the given files and every
+ * Run executable input_name in the directory open at run_fd (entered
+ * with fchdir), in a new process group, with stdin from /dev/null, and
+ * stdout and stderr in stdout_name and stderr_name, created new in
+ * run_fd with O_EXCL | O_NOFOLLOW. Every
  * other descriptor closed. The child stays unreaped while it is
  * watched, so its pid and group id cannot be reused; on timeout or
  * cancel the group gets SIGTERM, then SIGKILL after a 2 s grace, and
@@ -61,10 +73,10 @@ void orcac_free_child_env(char **envp);
  * when the child exits.
  */
 int orcac_run_orca(const char *executable,
-                   const char *run_dir,
+                   int run_fd,
                    const char *input_name,
-                   const char *stdout_path,
-                   const char *stderr_path,
+                   const char *stdout_name,
+                   const char *stderr_name,
                    const OrcacRunOptions *options,
                    OrcacChildResult *result,
                    char *errbuf,

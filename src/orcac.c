@@ -7,11 +7,13 @@
 #include "orcac_internal.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -35,13 +37,11 @@
 
 static _Thread_local char tls_error[ORCAC_LAST_ERROR_SIZE];
 
-typedef struct RunPaths {
-  char *inp;
-  char *out;
-  char *err;
-  char *engrad;
-  char *gbw;
-} RunPaths;
+#define RUN_INP "orcac.inp"
+#define RUN_OUT "orcac.out"
+#define RUN_ERR "orcac.err"
+#define RUN_ENGRAD "orcac.engrad"
+#define RUN_GBW "orcac.gbw"
 
 static char *dup_string(const char *src) {
   size_t n;
@@ -74,33 +74,42 @@ static void copy_text(char *dst, size_t dst_n, const char *src) {
   dst[n] = '\0';
 }
 
-static char *join_path2(const char *a, const char *b) {
-  size_t na = strlen(a);
-  size_t nb = strlen(b);
-  char *out = (char *)malloc(na + nb + 2u);
-  if (out == NULL) {
-    return NULL;
-  }
-  memcpy(out, a, na);
-  out[na] = '/';
-  memcpy(out + na + 1u, b, nb + 1u);
-  return out;
-}
-
-static int write_text_file(const char *path, const char *text, char *errbuf,
-                           size_t errbuf_n) {
-  FILE *fp = fopen(path, "wb");
-  if (fp == NULL) {
-    orcac_errf(errbuf, errbuf_n, "orcac: could not write %s: %s", path,
-               strerror(errno));
+/*
+ * Create name in the directory open at dirfd, which must not exist yet
+ * and is never followed as a symlink, and write text to it. dir names
+ * the directory in messages.
+ */
+static int write_new_file_at(int dirfd, const char *dir, const char *name,
+                             const char *text, char *errbuf,
+                             size_t errbuf_n) {
+  size_t left = strlen(text);
+  int fd = openat(dirfd, name,
+                  O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+  if (fd < 0) {
+    orcac_errf(errbuf, errbuf_n, "orcac: could not create %s/%s: %s", dir,
+               name, strerror(errno));
     return -1;
   }
-  if (fputs(text, fp) == EOF || fflush(fp) != 0) {
-    fclose(fp);
-    orcac_errf(errbuf, errbuf_n, "orcac: write failed for %s", path);
+  while (left > 0) {
+    ssize_t put = write(fd, text, left);
+    if (put < 0 && errno == EINTR) {
+      continue;
+    }
+    if (put <= 0) {
+      int saved = put < 0 ? errno : EIO;
+      close(fd);
+      orcac_errf(errbuf, errbuf_n, "orcac: write failed for %s/%s: %s", dir,
+                 name, strerror(saved));
+      return -1;
+    }
+    text += put;
+    left -= (size_t)put;
+  }
+  if (close(fd) != 0) {
+    orcac_errf(errbuf, errbuf_n, "orcac: write failed for %s/%s: %s", dir,
+               name, strerror(errno));
     return -1;
   }
-  fclose(fp);
   return 0;
 }
 
@@ -391,7 +400,7 @@ int orcac_create(const OrcaCConfig *config, OrcaCSession **out, char *errbuf,
 
 report:
   if (s != NULL) {
-    orcac_session_close(&s->dirs);
+    orcac_session_close(&s->dirs, NULL, 0);
     free_settings(&s->settings);
     free(s->exe);
     free(s);
@@ -438,14 +447,14 @@ int orcac_configure(OrcaCSession *s, const OrcaCConfig *config) {
       st = ORCAC_E_ERROR;
       goto done;
     }
-    orcac_cache_clear(&s->guesses, s->dirs.guess);
-    orcac_session_close(&s->dirs);
+    orcac_cache_clear(&s->guesses, s->dirs.guess_fd);
+    orcac_session_close(&s->dirs, NULL, 0);
     s->dirs = moved;
     s->run_not_emptied = 0;
   } else if (next.charge != s->settings.charge ||
              next.multiplicity != s->settings.multiplicity ||
              next.guess_policy == ORCAC_GUESS_FRESH) {
-    orcac_cache_clear(&s->guesses, s->dirs.guess);
+    orcac_cache_clear(&s->guesses, s->dirs.guess_fd);
   }
   free_settings(&s->settings);
   s->settings = next;
@@ -459,9 +468,11 @@ done:
   return st;
 }
 
-static void append_tails(OrcaCSession *s, const RunPaths *p) {
-  char *stderr_tail = orcac_file_tail(p->err, ORCAC_TAIL_BYTES);
-  char *stdout_tail = orcac_file_tail(p->out, ORCAC_TAIL_BYTES);
+static void append_tails(OrcaCSession *s) {
+  char *stderr_tail =
+      orcac_file_tail_at(s->dirs.run_fd, RUN_ERR, ORCAC_TAIL_BYTES);
+  char *stdout_tail =
+      orcac_file_tail_at(s->dirs.run_fd, RUN_OUT, ORCAC_TAIL_BYTES);
   char head[ORCAC_LAST_ERROR_SIZE];
   copy_text(head, sizeof(head), s->last_error);
   orcac_errf(s->last_error, sizeof(s->last_error),
@@ -490,7 +501,7 @@ static void note_kept_run(OrcaCSession *s) {
  * One ORCA run. Leaves the error text in s->last_error and fills parsed
  * on ORCAC_OK. info counts runs and records the last exit.
  */
-static int run_once(OrcaCSession *s, const RunPaths *p, int n_atoms,
+static int run_once(OrcaCSession *s, int n_atoms,
                     const double *positions_ang, const int *atomic_numbers,
                     int slot, OrcacEngrad *parsed,
                     OrcaCResult *info) {
@@ -529,7 +540,7 @@ static int run_once(OrcaCSession *s, const RunPaths *p, int n_atoms,
     orcac_cache_slot_name(slot, moinp_name);
   }
   if (slot >= 0 &&
-      orcac_cache_copy_out(s->dirs.guess, slot, s->dirs.run) != 0) {
+      orcac_cache_copy_out(s->dirs.guess_fd, slot, s->dirs.run_fd) != 0) {
     orcac_errf(err, err_n, "orcac: could not copy the MORead guess");
     return ORCAC_E_ERROR;
   }
@@ -547,7 +558,8 @@ static int run_once(OrcaCSession *s, const RunPaths *p, int n_atoms,
                          err_n) != 0) {
     goto out;
   }
-  if (write_text_file(p->inp, input_text, err, err_n) != 0) {
+  if (write_new_file_at(s->dirs.run_fd, s->dirs.run, RUN_INP, input_text, err,
+                        err_n) != 0) {
     goto out;
   }
   if ((s->settings.flags & ORCAC_F_KEEP_MPI_ENV) == 0) {
@@ -561,7 +573,7 @@ static int run_once(OrcaCSession *s, const RunPaths *p, int n_atoms,
   options.envp = envp;
   options.cancel_gen = &s->cancel_gen;
   options.cancel_seen = s->cancel_seen;
-  if (orcac_run_orca(s->exe, s->dirs.run, "orcac.inp", p->out, p->err,
+  if (orcac_run_orca(s->exe, s->dirs.run_fd, RUN_INP, RUN_OUT, RUN_ERR,
                      &options, &child, err, err_n) != 0) {
     goto out;
   }
@@ -581,7 +593,7 @@ static int run_once(OrcaCSession *s, const RunPaths *p, int n_atoms,
     st = ORCAC_E_TIMEOUT;
     goto out;
   }
-  if (orcac_read_file(p->out, &stdout_text) != 0) {
+  if (orcac_read_file_at(s->dirs.run_fd, RUN_OUT, &stdout_text) != 0) {
     stdout_text = NULL;
   }
   if (orcac_scf_not_converged(stdout_text)) {
@@ -614,8 +626,10 @@ static int run_once(OrcaCSession *s, const RunPaths *p, int n_atoms,
                "termination banner");
     goto out;
   }
-  if (orcac_read_file(p->engrad, &engrad_text) != 0) {
-    orcac_errf(err, err_n, "orcac: ORCA finished without writing orcac.engrad");
+  if (orcac_read_file_at(s->dirs.run_fd, RUN_ENGRAD, &engrad_text) != 0) {
+    orcac_errf(err, err_n,
+               "orcac: ORCA finished without writing orcac.engrad as a "
+               "regular file");
     goto out;
   }
   if (orcac_parse_engrad(engrad_text, n_atoms, parsed, err, err_n) != 0) {
@@ -643,7 +657,7 @@ out:
   if (st != ORCAC_OK) {
     orcac_free_engrad(parsed);
     if (started && st != ORCAC_E_CANCELLED) {
-      append_tails(s, p);
+      append_tails(s);
     }
   }
   orcac_free_child_env(envp);
@@ -738,7 +752,6 @@ static int evaluate(OrcaCSession *s, int n_atoms, const double *positions_ang,
                     OrcaCResult *meta) {
   double t0 = now_s();
   OrcaCResult info;
-  RunPaths paths;
   OrcacEngrad parsed;
   char *key = NULL;
   unsigned int seen;
@@ -768,26 +781,12 @@ static int evaluate(OrcaCSession *s, int n_atoms, const double *positions_ang,
   s->cancel_seen = seen;
 
   memset(&info, 0, sizeof(info));
-  memset(&paths, 0, sizeof(paths));
   memset(&parsed, 0, sizeof(parsed));
   info.exit_code = -1;
 
   st = check_call(n_atoms, positions_ang, atomic_numbers, want, energy_h,
                   gradient_h_bohr, s->last_error, sizeof(s->last_error));
   if (st != ORCAC_OK) {
-    goto done;
-  }
-
-  paths.inp = join_path2(s->dirs.run, "orcac.inp");
-  paths.out = join_path2(s->dirs.run, "orcac.out");
-  paths.err = join_path2(s->dirs.run, "orcac.err");
-  paths.engrad = join_path2(s->dirs.run, "orcac.engrad");
-  paths.gbw = join_path2(s->dirs.run, "orcac.gbw");
-  if (paths.inp == NULL || paths.out == NULL || paths.err == NULL ||
-      paths.engrad == NULL || paths.gbw == NULL) {
-    orcac_errf(s->last_error, sizeof(s->last_error),
-               "orcac: out of memory for run file paths");
-    st = ORCAC_E_ERROR;
     goto done;
   }
 
@@ -799,19 +798,19 @@ static int evaluate(OrcaCSession *s, int n_atoms, const double *positions_ang,
       st = ORCAC_E_ERROR;
       goto done;
     }
-    slot = orcac_cache_lookup(&s->guesses, s->dirs.guess, key, n_atoms,
+    slot = orcac_cache_lookup(&s->guesses, s->dirs.guess_fd, key, n_atoms,
                               atomic_numbers);
   }
-  st = run_once(s, &paths, n_atoms, positions_ang, atomic_numbers, slot,
+  st = run_once(s, n_atoms, positions_ang, atomic_numbers, slot,
                 &parsed, &info);
   info.used_guess = slot >= 0;
   if (st != ORCAC_OK && slot >= 0) {
-    orcac_cache_drop(&s->guesses, s->dirs.guess, slot);
+    orcac_cache_drop(&s->guesses, s->dirs.guess_fd, slot);
     if ((st == ORCAC_E_ERROR || st == ORCAC_E_NOT_CONVERGED) &&
         (s->settings.flags & ORCAC_F_NO_FRESH_RETRY) == 0) {
       info.retried_fresh = 1;
       info.used_guess = 0;
-      st = run_once(s, &paths, n_atoms, positions_ang, atomic_numbers, -1,
+      st = run_once(s, n_atoms, positions_ang, atomic_numbers, -1,
                     &parsed, &info);
       if (st != ORCAC_OK) {
         char head[ORCAC_LAST_ERROR_SIZE];
@@ -835,9 +834,9 @@ static int evaluate(OrcaCSession *s, int n_atoms, const double *positions_ang,
     memcpy(gradient_h_bohr, parsed.gradient_h_bohr,
            (size_t)n_atoms * 3u * sizeof(double));
   }
-  if (key != NULL && access(paths.gbw, R_OK) == 0) {
-    orcac_cache_store(&s->guesses, s->dirs.guess, paths.gbw, key, n_atoms,
-                      atomic_numbers);
+  if (key != NULL) {
+    orcac_cache_store(&s->guesses, s->dirs.guess_fd, s->dirs.run_fd, RUN_GBW,
+                      key, n_atoms, atomic_numbers);
   }
   /*
    * The header promises "" with ORCAC_OK, so a failed cleanup does not
@@ -861,11 +860,6 @@ done:
   pthread_mutex_unlock(&s->lock);
   orcac_free_engrad(&parsed);
   free(key);
-  free(paths.inp);
-  free(paths.out);
-  free(paths.err);
-  free(paths.engrad);
-  free(paths.gbw);
   return st;
 }
 
@@ -930,7 +924,13 @@ void orcac_destroy(OrcaCSession *s) {
     return;
   }
   if (getpid() == s->owner_pid) {
-    orcac_session_close(&s->dirs);
+    char err[ORCAC_LAST_ERROR_SIZE];
+    err[0] = '\0';
+    if (orcac_session_close(&s->dirs, err, sizeof(err)) != 0) {
+      finish(NULL, NULL, ORCAC_E_ERROR, err);
+    } else {
+      finish(NULL, NULL, ORCAC_OK, "");
+    }
     pthread_mutex_destroy(&s->lock);
   } else {
     orcac_session_free(&s->dirs);
