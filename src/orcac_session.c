@@ -126,6 +126,40 @@ static int paths_fail(const OrcacSessionDirs *dirs, const char *name) {
 #endif
 }
 
+/*
+ * Make again whatever part of the layout a failed removal took, and
+ * reopen run_fd and guess_fd; one that cannot be made stays -1, which
+ * the next reset or guess lookup already handles. errno is kept.
+ */
+static void reopen_layout(OrcacSessionDirs *dirs) {
+  int saved = errno;
+  (void)mkdirat(dirs->root_fd, "run", 0700);
+  (void)mkdirat(dirs->root_fd, "guess", 0700);
+  (void)mkdirat(dirs->root_fd, "keep", 0700);
+  dirs->run_fd = openat(dirs->root_fd, "run", DIR_FLAGS);
+  dirs->guess_fd = openat(dirs->root_fd, "guess", DIR_FLAGS);
+  errno = saved;
+}
+
+int orcac_session_remove(OrcacSessionDirs *dirs, char *errbuf,
+                         size_t errbuf_n) {
+  if (dirs->root == NULL || dirs->root_fd < 0 || dirs->parent_fd < 0) {
+    orcac_session_free(dirs);
+    return 0;
+  }
+  close_fd(&dirs->run_fd);
+  close_fd(&dirs->guess_fd);
+  if (remove_root(dirs, dirs->root_name) == 0) {
+    orcac_session_free(dirs);
+    return 0;
+  }
+  orcac_errf(errbuf, errbuf_n,
+             "orcac: could not remove session directory %s: %s", dirs->root,
+             strerror(errno));
+  reopen_layout(dirs);
+  return -1;
+}
+
 int orcac_session_close(OrcacSessionDirs *dirs, char *errbuf,
                         size_t errbuf_n) {
   int rc = 0;

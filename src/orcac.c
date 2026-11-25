@@ -448,7 +448,17 @@ int orcac_configure(OrcaCSession *s, const OrcaCConfig *config) {
       goto done;
     }
     orcac_cache_clear(&s->guesses, s->dirs.guess_fd);
-    orcac_session_close(&s->dirs, NULL, 0);
+    if (orcac_session_remove(&s->dirs, s->last_error,
+                             sizeof(s->last_error)) != 0) {
+      size_t used = strlen(s->last_error);
+      orcac_errf(s->last_error + used, sizeof(s->last_error) - used,
+                 "; the session keeps its settings and directory");
+      orcac_session_close(&moved, NULL, 0);
+      free_settings(&next);
+      free(exe_copy);
+      st = ORCAC_E_ERROR;
+      goto done;
+    }
     s->dirs = moved;
     s->run_not_emptied = 0;
   } else if (next.charge != s->settings.charge ||

@@ -41,6 +41,16 @@ int orcac_session_open(const char *scratch_root, OrcacSessionDirs *dirs,
 int orcac_session_close(OrcacSessionDirs *dirs, char *errbuf,
                         size_t errbuf_n);
 
+/*
+ * orcac_session_close, except that a tree that cannot be removed is
+ * kept in use: dirs is freed only on success. On -1, with the reason
+ * in errbuf, the paths and the pinned parent and root stay as they
+ * were, and run/, guess/ and keep/ are made again where the removal
+ * took them, with run_fd and guess_fd reopened (-1 if that failed).
+ */
+int orcac_session_remove(OrcacSessionDirs *dirs, char *errbuf,
+                         size_t errbuf_n);
+
 /* Free the paths and close the descriptors, leaving the files. */
 void orcac_session_free(OrcacSessionDirs *dirs);
 

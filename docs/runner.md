@@ -79,6 +79,11 @@ message, as the header promises; the next attempt must empty `run/`
 before ORCA starts and names both failures if it cannot.
 `orcac_configure` with a new `scratch_dir` and `orcac_destroy` remove the
 whole session; a forked child's `orcac_destroy` leaves it to the owner.
+When `orcac_configure` cannot remove the old tree it returns
+`ORCAC_E_ERROR` with the directory and the reason, removes the new tree
+again and keeps the old settings and the old pinned tree, making
+`run/`, `guess/` and `keep/` again where the failed removal took them;
+only the stored guesses are gone.
 When `orcac_destroy` cannot remove the tree, `orcac_last_error(NULL)`
 names the directory and the reason; after a clean destroy it is empty.
 
@@ -182,7 +187,8 @@ including a directory swapped for a symlink during removal, an ancestor
 renamed out of the tree just before a descent or an unlink, a directory
 that keeps refilling, the session root swapped for a decoy mid-call and
 before destroy, the root renamed away before or during its removal,
-a new root undone while every allocation keeps failing,
+a new root undone while every allocation keeps failing, a move to a
+new `scratch_dir` whose old tree cannot be removed,
 `.gbw` and `.engrad` outputs left as symlinks, the owner
 pid check, unconverged-SCF detection with banners echoed from the
 input, the termination banner echoed from `blocks` on both the exit-0

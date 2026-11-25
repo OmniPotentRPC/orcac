@@ -1228,6 +1228,113 @@ static void test_session_alloc_stuck(const char *scratch) {
   CHECK(opened && failed >= 6, "not every path allocation was failed");
 }
 
+/*
+ * orcac_configure to a new scratch_dir fails when the old session tree
+ * cannot be removed: the new tree goes again, the session keeps its
+ * settings and its pinned tree, with run/, guess/ and keep/ made again
+ * where the removal took them, and later calls run in it.
+ */
+static void test_configure_cleanup_fails(const char *fake_bin,
+                                         const char *scratch) {
+  OrcaCConfig cfg;
+  OrcaCConfig moved_cfg;
+  OrcaCSession *s = NULL;
+  char next[4096];
+  char moved[4096];
+  char root[PATH_MAX + 32];
+  char path[PATH_MAX + 64];
+  double e = 3.0;
+  int before = entry_count(scratch);
+  int parent_fd;
+  int root_fd;
+
+  snprintf(next, sizeof(next), "%s/next", scratch);
+  snprintf(moved, sizeof(moved), "%s/moved-cfg", scratch);
+  CHECK(mkdir(next, 0700) == 0, "mkdir next scratch");
+  orcac_config_init(&cfg, sizeof(cfg));
+  cfg.executable = fake_bin;
+  cfg.scratch_dir = scratch;
+  cfg.timeout_s = 30.0;
+  moved_cfg = cfg;
+  moved_cfg.scratch_dir = next;
+
+  CHECK(orcac_create(&cfg, &s, NULL, 0) == ORCAC_OK, "create");
+  if (s == NULL) {
+    return;
+  }
+  snprintf(root, sizeof(root), "%s", s->dirs.root);
+  parent_fd = s->dirs.parent_fd;
+  root_fd = s->dirs.root_fd;
+  CHECK(rename(root, moved) == 0, "rename the root away");
+  CHECK(orcac_configure(s, &moved_cfg) == ORCAC_E_ERROR,
+        "configure succeeded with the old root left behind");
+  CHECK(strstr(orcac_last_error(s), "could not remove session directory") !=
+                NULL &&
+            strstr(orcac_last_error(s), strerror(EXDEV)) != NULL &&
+            strstr(orcac_last_error(s), "keeps its settings") != NULL,
+        "failed cleanup not reported by configure");
+  CHECK(entry_count(next) == 0, "new session tree left after the failure");
+  CHECK(strcmp(s->settings.scratch_dir, scratch) == 0,
+        "settings changed by a failed configure");
+  CHECK(s->dirs.root != NULL && strcmp(s->dirs.root, root) == 0 &&
+            s->dirs.parent_fd == parent_fd && s->dirs.root_fd == root_fd &&
+            s->dirs.run_fd >= 0 && s->dirs.guess_fd >= 0,
+        "old session directories forgotten by a failed configure");
+  CHECK(entry_count(moved) == 3, "renamed root touched by configure");
+  CHECK(orcac_energy_gradient(s, 3, kPos, kZ, ORCAC_WANT_ENERGY, &e, NULL,
+                              NULL) == ORCAC_OK &&
+            fabs(e + 75.5) < 1e-12,
+        "call after a failed configure");
+  CHECK(rename(moved, root) == 0, "rename the root back");
+  orcac_destroy(s);
+  CHECK(orcac_last_error(NULL)[0] == '\0' && access(root, F_OK) != 0,
+        "old tree not removed by destroy after a failed configure");
+
+  if (geteuid() != 0) {
+    s = NULL;
+    CHECK(orcac_create(&cfg, &s, NULL, 0) == ORCAC_OK, "create to lock");
+    if (s == NULL) {
+      rmdir(next);
+      return;
+    }
+    snprintf(root, sizeof(root), "%s", s->dirs.root);
+    snprintf(path, sizeof(path), "%s/guess/marker", root);
+    write_file(path, "marker");
+    snprintf(path, sizeof(path), "%s/locked", s->dirs.run);
+    CHECK(mkdir(path, 0700) == 0, "mkdir run/locked");
+    snprintf(path, sizeof(path), "%s/locked/f", s->dirs.run);
+    write_file(path, "f");
+    snprintf(path, sizeof(path), "%s/locked", s->dirs.run);
+    CHECK(chmod(path, 0500) == 0, "lock run/locked");
+    CHECK(orcac_configure(s, &moved_cfg) == ORCAC_E_ERROR &&
+              strstr(orcac_last_error(s), strerror(EACCES)) != NULL,
+          "configure succeeded with part of the old tree left");
+    CHECK(entry_count(next) == 0, "new tree left after a partial cleanup");
+    CHECK(strcmp(s->settings.scratch_dir, scratch) == 0 &&
+              strcmp(s->dirs.root, root) == 0,
+          "session moved by a failed configure");
+    CHECK(entry_count(root) == 3 && s->dirs.run_fd >= 0 &&
+              s->dirs.guess_fd >= 0,
+          "layout not made again after a partial cleanup");
+    snprintf(path, sizeof(path), "%s/guess", root);
+    CHECK(access(path, F_OK) == 0 && entry_count(path) == 0,
+          "guess/ was not removed and made again");
+    snprintf(path, sizeof(path), "%s/locked", s->dirs.run);
+    CHECK(chmod(path, 0700) == 0, "unlock run/locked");
+    CHECK(orcac_energy_gradient(s, 3, kPos, kZ, ORCAC_WANT_ENERGY, &e, NULL,
+                                NULL) == ORCAC_OK,
+          "call after a partial cleanup");
+    CHECK(orcac_configure(s, &moved_cfg) == ORCAC_OK &&
+              entry_count(next) == 1 && access(root, F_OK) != 0,
+          "configure once the old tree could be removed");
+    orcac_destroy(s);
+    CHECK(orcac_last_error(NULL)[0] == '\0' && entry_count(next) == 0,
+          "destroy after the move");
+  }
+  CHECK(rmdir(next) == 0, "remove next scratch");
+  CHECK(entry_count(scratch) == before, "scratch not back to its entries");
+}
+
 static char swap_session_to[PATH_MAX + 32];
 static char swap_decoy_target[PATH_MAX + 32];
 
@@ -1401,6 +1508,7 @@ int main(int argc, char **argv) {
   test_session_alloc_fail(scratch);
   test_session_close_renamed(scratch);
   test_session_alloc_stuck(scratch);
+  test_configure_cleanup_fails(fake_bin, scratch);
   CHECK(entry_count(scratch) == 0, "scratch directory left non-empty");
   rmdir(scratch);
   test_remove_tree();
