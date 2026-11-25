@@ -12,6 +12,7 @@
 
 #ifdef ORCAC_TEST_HOOKS
 void (*orcac_test_after_keep)(int root_fd) = NULL;
+void (*orcac_test_before_keep)(int root_fd, int keep_fd) = NULL;
 int (*orcac_test_paths_fail)(int parent_fd, const char *root_name) = NULL;
 int orcac_test_alloc_fail = 0;
 #endif
@@ -69,6 +70,7 @@ static void init_dirs(OrcacSessionDirs *dirs) {
   dirs->root_fd = -1;
   dirs->run_fd = -1;
   dirs->guess_fd = -1;
+  dirs->keep_fd = -1;
 }
 
 /* A zeroed struct, as in a calloc'd session, holds no descriptors. */
@@ -79,6 +81,7 @@ void orcac_session_free(OrcacSessionDirs *dirs) {
   if (dirs->root != NULL) {
     close_fd(&dirs->run_fd);
     close_fd(&dirs->guess_fd);
+    close_fd(&dirs->keep_fd);
     close_fd(&dirs->root_fd);
     close_fd(&dirs->parent_fd);
   }
@@ -128,8 +131,9 @@ static int paths_fail(const OrcacSessionDirs *dirs, const char *name) {
 
 /*
  * Make again whatever part of the layout a failed removal took, and
- * reopen run_fd and guess_fd; one that cannot be made stays -1, which
- * the next reset or guess lookup already handles. errno is kept.
+ * reopen run_fd, guess_fd and keep_fd; one that cannot be made stays
+ * -1, which the next reset, guess lookup or keep already handles. errno
+ * is kept.
  */
 static void reopen_layout(OrcacSessionDirs *dirs) {
   int saved = errno;
@@ -138,6 +142,7 @@ static void reopen_layout(OrcacSessionDirs *dirs) {
   (void)mkdirat(dirs->root_fd, "keep", 0700);
   dirs->run_fd = openat(dirs->root_fd, "run", DIR_FLAGS);
   dirs->guess_fd = openat(dirs->root_fd, "guess", DIR_FLAGS);
+  dirs->keep_fd = openat(dirs->root_fd, "keep", DIR_FLAGS);
   errno = saved;
 }
 
@@ -149,6 +154,7 @@ int orcac_session_remove(OrcacSessionDirs *dirs, char *errbuf,
   }
   close_fd(&dirs->run_fd);
   close_fd(&dirs->guess_fd);
+  close_fd(&dirs->keep_fd);
   if (remove_root(dirs, dirs->root_name) == 0) {
     orcac_session_free(dirs);
     return 0;
@@ -169,6 +175,7 @@ int orcac_session_close(OrcacSessionDirs *dirs, char *errbuf,
   if (dirs->root != NULL && dirs->root_fd >= 0 && dirs->parent_fd >= 0) {
     close_fd(&dirs->run_fd);
     close_fd(&dirs->guess_fd);
+    close_fd(&dirs->keep_fd);
     if (remove_root(dirs, dirs->root_name) != 0) {
       orcac_errf(errbuf, errbuf_n,
                  "orcac: could not remove session directory %s: %s",
@@ -215,7 +222,8 @@ int orcac_session_open(const char *scratch_root, OrcacSessionDirs *dirs,
       mkdirat(dirs->root_fd, "guess", 0700) != 0 ||
       mkdirat(dirs->root_fd, "keep", 0700) != 0 ||
       (dirs->run_fd = openat(dirs->root_fd, "run", DIR_FLAGS)) < 0 ||
-      (dirs->guess_fd = openat(dirs->root_fd, "guess", DIR_FLAGS)) < 0) {
+      (dirs->guess_fd = openat(dirs->root_fd, "guess", DIR_FLAGS)) < 0 ||
+      (dirs->keep_fd = openat(dirs->root_fd, "keep", DIR_FLAGS)) < 0) {
     orcac_errf(errbuf, errbuf_n,
                "orcac: could not create the scratch layout in %s: %s", root,
                strerror(errno));
@@ -238,20 +246,66 @@ int orcac_session_reset_run(OrcacSessionDirs *dirs, char *errbuf,
   return 0;
 }
 
+/* 1 while name in dirfd is the directory open at fd. errno is kept. */
+static int entry_is_fd(int dirfd, const char *name, int fd) {
+  int saved = errno;
+  struct stat st;
+  struct stat entry;
+  int ok = fd >= 0 && fstat(fd, &st) == 0 &&
+           fstatat(dirfd, name, &entry, AT_SYMLINK_NOFOLLOW) == 0 &&
+           S_ISDIR(entry.st_mode) && st.st_dev == entry.st_dev &&
+           st.st_ino == entry.st_ino;
+  errno = saved;
+  return ok;
+}
+
+static int keep_pinned(const OrcacSessionDirs *dirs) {
+  return entry_is_fd(dirs->root_fd, "keep", dirs->keep_fd) &&
+         entry_is_fd(dirs->root_fd, "run", dirs->run_fd);
+}
+
+/*
+ * renameat cannot name an inode, so keep/ can still leave the root
+ * between the last check and the rename and take the files with it;
+ * the check afterwards sees that and moves them back into the root.
+ */
+static int move_run_to_keep(OrcacSessionDirs *dirs) {
+  int root_fd = dirs->root_fd;
+  int keep_fd = dirs->keep_fd;
+  if (!keep_pinned(dirs)) {
+    errno = EXDEV;
+    return -1;
+  }
+  if (orcac_remove_tree_below(root_fd, keep_fd, 1, "failed") != 0) {
+    return -1;
+  }
+  if (!keep_pinned(dirs)) {
+    errno = EXDEV;
+    return -1;
+  }
+#ifdef ORCAC_TEST_HOOKS
+  if (orcac_test_before_keep != NULL) {
+    orcac_test_before_keep(root_fd, keep_fd);
+  }
+#endif
+  if (renameat(root_fd, "run", keep_fd, "failed") != 0) {
+    return -1;
+  }
+  if (!entry_is_fd(root_fd, "keep", keep_fd) ||
+      !entry_is_fd(keep_fd, "failed", dirs->run_fd)) {
+    if (entry_is_fd(keep_fd, "failed", dirs->run_fd)) {
+      (void)renameat(keep_fd, "failed", root_fd, "run");
+    }
+    errno = EXDEV;
+    return -1;
+  }
+  return 0;
+}
+
 int orcac_session_keep_run(OrcacSessionDirs *dirs) {
-  int keep_fd;
-  int kept;
+  int kept = move_run_to_keep(dirs);
+  int saved = errno;
   close_fd(&dirs->run_fd);
-  keep_fd = openat(dirs->root_fd, "keep", DIR_FLAGS);
-  if (keep_fd < 0) {
-    return -1;
-  }
-  if (orcac_remove_tree_below(dirs->root_fd, keep_fd, 1, "failed") != 0) {
-    close(keep_fd);
-    return -1;
-  }
-  kept = renameat(dirs->root_fd, "run", keep_fd, "failed") == 0 ? 0 : -1;
-  close(keep_fd);
 #ifdef ORCAC_TEST_HOOKS
   if (kept == 0 && orcac_test_after_keep != NULL) {
     orcac_test_after_keep(dirs->root_fd);
@@ -260,5 +314,6 @@ int orcac_session_keep_run(OrcacSessionDirs *dirs) {
   if (mkdirat(dirs->root_fd, "run", 0700) == 0 || errno == EEXIST) {
     dirs->run_fd = openat(dirs->root_fd, "run", DIR_FLAGS);
   }
+  errno = saved;
   return kept;
 }

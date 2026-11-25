@@ -91,9 +91,16 @@ Nothing in the session is reached by path. The scratch directory is
 opened first and stays pinned; `mkdirat` makes the root relative to
 it, trying fresh random names while the name is taken, and the root is
 then opened through the pinned parent with `O_DIRECTORY | O_NOFOLLOW` and
-must be that entry, owned by the caller and mode 0700. `run/` and
-`guess/` are pinned the same way, and `run/` again each time it is
-recreated. The deck and ORCA's stdout and stderr are created with
+must be that entry, owned by the caller and mode 0700. `run/`,
+`guess/` and `keep/` are pinned the same way, and `run/` again each
+time it is recreated. A failed run moves to `keep/failed` with one
+`renameat` between the pinned root and the pinned `keep/`, made only
+while the root's `run` and `keep` entries are still those descriptors
+by device and inode; a `keep/` renamed away or replaced by a symlink or
+another directory gets nothing, the call fails with `EXDEV` and the
+files stay in `run/`. If `keep/` leaves the root in the window between
+that check and the rename, the check after it sees the move and puts
+the files back in `run/`. The deck and ORCA's stdout and stderr are created with
 `openat(..., O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC)` in the pinned
 `run/`, ORCA starts there through `fchdir`, and its outputs, the `.gbw`
 stored as a guess included, are read with `O_NOFOLLOW` and must be

@@ -1149,6 +1149,110 @@ static void test_session_close_renamed(const char *scratch) {
 }
 
 /*
+ * A failed run is moved only into the keep/ pinned when the session was
+ * made: a keep/ replaced by another directory or by a symlink, or
+ * renamed out of the root, gets nothing, and the files stay in run/.
+ */
+static void test_keep_replaced(const char *scratch) {
+  OrcacSessionDirs dirs;
+  char err[256];
+  char keep[PATH_MAX + 32];
+  char held[PATH_MAX + 32];
+  char path[PATH_MAX + 64];
+  int before = entry_count(scratch);
+
+  CHECK(orcac_session_open(scratch, &dirs, err, sizeof(err)) == 0,
+        "open for a replaced keep/");
+  if (dirs.root == NULL) {
+    return;
+  }
+  snprintf(keep, sizeof(keep), "%s/keep", dirs.root);
+  snprintf(held, sizeof(held), "%s/keep-held", scratch);
+  snprintf(path, sizeof(path), "%s/marker", dirs.run);
+  write_file(path, "marker");
+
+  CHECK(rename(keep, held) == 0 && mkdir(keep, 0700) == 0,
+        "replace keep/ with another directory");
+  errno = 0;
+  CHECK(orcac_session_keep_run(&dirs) != 0 && errno == EXDEV,
+        "run moved into a replaced keep/");
+  CHECK(entry_count(keep) == 0 && entry_count(held) == 0,
+        "replaced or moved keep/ received the run");
+  CHECK(file_is(dirs.run, "marker", "marker") && dirs.run_fd >= 0,
+        "run files lost when keep/ was replaced");
+
+  CHECK(rmdir(keep) == 0 && symlink(held, keep) == 0,
+        "replace keep/ with a symlink");
+  errno = 0;
+  CHECK(orcac_session_keep_run(&dirs) != 0 && errno == EXDEV,
+        "run moved through a symlinked keep/");
+  CHECK(entry_count(held) == 0, "symlinked keep/ followed");
+
+  CHECK(unlink(keep) == 0, "remove the keep/ symlink");
+  errno = 0;
+  CHECK(orcac_session_keep_run(&dirs) != 0 && errno == EXDEV,
+        "run moved into a keep/ renamed out of the root");
+  CHECK(entry_count(held) == 0, "keep/ renamed away received the run");
+  CHECK(file_is(dirs.run, "marker", "marker"),
+        "run files lost when keep/ was renamed away");
+
+  CHECK(rename(held, keep) == 0, "put keep/ back");
+  CHECK(orcac_session_keep_run(&dirs) == 0 &&
+            file_is(dirs.keep_failed, "marker", "marker"),
+        "run not kept once keep/ is back");
+  CHECK(orcac_session_close(&dirs, err, sizeof(err)) == 0,
+        "close after keep/ came back");
+  CHECK(entry_count(scratch) == before, "scratch not back to its entries");
+}
+
+static char keep_race_to[PATH_MAX + 32];
+static int keep_race_calls = 0;
+
+/* In the window before the renameat, move keep/ out of the root. */
+static void move_keep_out(int root_fd, int keep_fd) {
+  (void)keep_fd;
+  ++keep_race_calls;
+  CHECK(renameat(root_fd, "keep", AT_FDCWD, keep_race_to) == 0,
+        "move keep/ out before the rename");
+}
+
+/*
+ * keep/ leaving the root between the last check and the renameat takes
+ * the run with it; keep_run sees that, moves the files back to run/
+ * and fails with EXDEV.
+ */
+static void test_keep_moved_in_window(const char *scratch) {
+  OrcacSessionDirs dirs;
+  char err[256];
+  char path[PATH_MAX + 64];
+  int before = entry_count(scratch);
+
+  CHECK(orcac_session_open(scratch, &dirs, err, sizeof(err)) == 0,
+        "open for the keep/ race");
+  if (dirs.root == NULL) {
+    return;
+  }
+  snprintf(keep_race_to, sizeof(keep_race_to), "%s/keep-out", scratch);
+  snprintf(path, sizeof(path), "%s/marker", dirs.run);
+  write_file(path, "marker");
+  keep_race_calls = 0;
+  orcac_test_before_keep = move_keep_out;
+  errno = 0;
+  CHECK(orcac_session_keep_run(&dirs) != 0 && errno == EXDEV,
+        "run kept in a keep/ moved out of the root");
+  orcac_test_before_keep = NULL;
+  CHECK(keep_race_calls == 1, "keep/ race hook not called");
+  CHECK(entry_count(keep_race_to) == 0,
+        "run left in a keep/ outside the session tree");
+  CHECK(file_is(dirs.run, "marker", "marker") && dirs.run_fd >= 0,
+        "run files not moved back to run/");
+  CHECK(orcac_session_close(&dirs, err, sizeof(err)) == 0,
+        "close after the keep/ race");
+  CHECK(rmdir(keep_race_to) == 0, "remove the moved keep/");
+  CHECK(entry_count(scratch) == before, "scratch not back to its entries");
+}
+
+/*
  * With allocation failing for good from the kth path allocation of
  * orcac_session_open on, the new root is still removed: undoing it
  * allocates nothing. The full walk, which needs a directory stream,
@@ -1507,6 +1611,8 @@ int main(int argc, char **argv) {
   test_session_paths_oom(scratch);
   test_session_alloc_fail(scratch);
   test_session_close_renamed(scratch);
+  test_keep_replaced(scratch);
+  test_keep_moved_in_window(scratch);
   test_session_alloc_stuck(scratch);
   test_configure_cleanup_fails(fake_bin, scratch);
   CHECK(entry_count(scratch) == 0, "scratch directory left non-empty");

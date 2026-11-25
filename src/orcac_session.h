@@ -11,10 +11,11 @@
  *     keep/failed/               the most recent failed attempt
  *
  * Everything goes through descriptors: the scratch directory is pinned
- * in parent_fd, the root in root_fd, and run/ and guess/ in run_fd and
- * guess_fd, each opened with O_NOFOLLOW. Files are created, read,
- * renamed and removed relative to them, so replacing any path component
- * cannot redirect them. The path strings are for messages only.
+ * in parent_fd, the root in root_fd, and run/, guess/ and keep/ in
+ * run_fd, guess_fd and keep_fd, each opened with O_NOFOLLOW. Files are
+ * created, read, renamed and removed relative to them, so replacing any
+ * path component cannot redirect them. The path strings are for
+ * messages only.
  */
 typedef struct OrcacSessionDirs {
   char *root;
@@ -26,6 +27,7 @@ typedef struct OrcacSessionDirs {
   int root_fd;
   int run_fd;   /* the current run/; -1 when it could not be made */
   int guess_fd;
+  int keep_fd;  /* keep/ as made with the root; -1 when it could not be */
 } OrcacSessionDirs;
 
 /* scratch_root NULL or "" uses $TMPDIR, then /tmp. */
@@ -62,12 +64,24 @@ int orcac_session_reset_run(OrcacSessionDirs *dirs, char *errbuf,
  * Move run/ to keep/failed/, replacing an older one, and recreate an
  * empty run/. Returns 0 when the files were kept, even if run/ could
  * not be recreated; the next orcac_session_reset_run makes it again.
+ * The move is a renameat between the pinned root and the pinned keep/,
+ * made only while the root's entries run and keep are still run_fd and
+ * keep_fd, by device and inode: a keep/ or run/ renamed away, or
+ * replaced by a symlink or another directory, is -1 with EXDEV and
+ * nothing moves. If keep/ leaves the root between that check and the
+ * rename, the files are moved back to run/ and the result is -1 with
+ * EXDEV.
  */
 int orcac_session_keep_run(OrcacSessionDirs *dirs);
 
 #ifdef ORCAC_TEST_HOOKS
 /* Called with root_fd once run/ has been moved to keep/failed. */
 extern void (*orcac_test_after_keep)(int root_fd);
+/*
+ * Called by orcac_session_keep_run after its last check of run/ and
+ * keep/, right before the renameat.
+ */
+extern void (*orcac_test_before_keep)(int root_fd, int keep_fd);
 /*
  * Asked by orcac_session_open once the paths are allocated; nonzero
  * takes the out-of-memory path, which removes the new root without
