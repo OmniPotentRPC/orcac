@@ -601,6 +601,64 @@ static int make_run_dir_with(int mode, const char *scratch, char *err,
   return rc;
 }
 
+static int paths_swap_root = 0;
+
+/* Fail the path allocations, first moving the root aside if asked. */
+static int fail_paths(int parent_fd, const char *root_name) {
+  if (paths_swap_root) {
+    CHECK(renameat(parent_fd, root_name, parent_fd, "real-root") == 0 &&
+              mkdirat(parent_fd, root_name, 0700) == 0,
+          "swap the session root for a decoy");
+  }
+  return 1;
+}
+
+/*
+ * The out-of-memory path of orcac_session_open removes the new root,
+ * but only while its entry is still that root: a decoy put in its place
+ * stays.
+ */
+static void test_session_paths_oom(const char *scratch) {
+  OrcacSessionDirs dirs;
+  char err[256];
+  char path[4096];
+  int before = entry_count(scratch);
+
+  orcac_test_paths_fail = fail_paths;
+  paths_swap_root = 0;
+  CHECK(orcac_session_open(scratch, &dirs, err, sizeof(err)) != 0 &&
+            strstr(err, "out of memory") != NULL,
+        "session opened through the out-of-memory path");
+  CHECK(entry_count(scratch) == before, "root left after out of memory");
+
+  paths_swap_root = 1;
+  CHECK(orcac_session_open(scratch, &dirs, err, sizeof(err)) != 0,
+        "session opened with the root swapped");
+  orcac_test_paths_fail = NULL;
+  paths_swap_root = 0;
+  CHECK(entry_count(scratch) == before + 2,
+        "decoy in place of the root removed");
+  {
+    DIR *d = opendir(scratch);
+    struct dirent *ent;
+    int decoys = 0;
+    while (d != NULL && (ent = readdir(d)) != NULL) {
+      if (run_dir_name_ok(ent->d_name)) {
+        snprintf(path, sizeof(path), "%s/%s", scratch, ent->d_name);
+        CHECK(rmdir(path) == 0, "remove the decoy");
+        ++decoys;
+      }
+    }
+    if (d != NULL) {
+      closedir(d);
+    }
+    CHECK(decoys == 1, "decoy not kept under the root's name");
+  }
+  snprintf(path, sizeof(path), "%s/real-root", scratch);
+  CHECK(rmdir(path) == 0, "remove the moved root");
+  CHECK(entry_count(scratch) == before, "scratch not back to its entries");
+}
+
 /*
  * A session directory that fails its checks after mkdirat is removed
  * again when it is still the empty directory made, and nothing else
@@ -1116,6 +1174,7 @@ int main(int argc, char **argv) {
   test_pinned_run_files(fake_bin, scratch);
   test_make_run_dir(scratch);
   test_make_run_dir_discard(scratch);
+  test_session_paths_oom(scratch);
   CHECK(entry_count(scratch) == 0, "scratch directory left non-empty");
   rmdir(scratch);
   test_remove_tree();

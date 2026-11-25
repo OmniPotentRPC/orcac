@@ -12,6 +12,7 @@
 
 #ifdef ORCAC_TEST_HOOKS
 void (*orcac_test_after_keep)(int root_fd) = NULL;
+int (*orcac_test_paths_fail)(int parent_fd, const char *root_name) = NULL;
 #endif
 
 #define DIR_FLAGS (O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
@@ -92,6 +93,16 @@ static int remove_root(const OrcacSessionDirs *dirs) {
   return unlinkat(dirs->parent_fd, dirs->root_name, AT_REMOVEDIR);
 }
 
+static int paths_fail(const OrcacSessionDirs *dirs) {
+#ifdef ORCAC_TEST_HOOKS
+  return orcac_test_paths_fail != NULL && dirs->root_name != NULL &&
+         orcac_test_paths_fail(dirs->parent_fd, dirs->root_name);
+#else
+  (void)dirs;
+  return 0;
+#endif
+}
+
 int orcac_session_close(OrcacSessionDirs *dirs, char *errbuf,
                         size_t errbuf_n) {
   int rc = 0;
@@ -129,9 +140,9 @@ int orcac_session_open(const char *scratch_root, OrcacSessionDirs *dirs,
   dirs->keep_failed = keep != NULL ? join2(keep, "failed") : NULL;
   free(keep);
   if (dirs->root == NULL || dirs->root_name == NULL || dirs->run == NULL ||
-      dirs->guess == NULL || dirs->keep_failed == NULL) {
+      dirs->guess == NULL || dirs->keep_failed == NULL || paths_fail(dirs)) {
     if (dirs->root_name != NULL) {
-      unlinkat(dirs->parent_fd, dirs->root_name, AT_REMOVEDIR);
+      remove_root(dirs);
     }
     close_fd(&dirs->root_fd);
     close_fd(&dirs->parent_fd);

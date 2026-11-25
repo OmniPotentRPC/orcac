@@ -57,4 +57,9 @@ int orcac_session_keep_run(OrcacSessionDirs *dirs);
 #ifdef ORCAC_TEST_HOOKS
 /* Called with root_fd once run/ has been moved to keep/failed. */
 extern void (*orcac_test_after_keep)(int root_fd);
+/*
+ * Asked by orcac_session_open once the paths are allocated; nonzero
+ * takes the out-of-memory path, which removes the new root.
+ */
+extern int (*orcac_test_paths_fail)(int parent_fd, const char *root_name);
 #endif
