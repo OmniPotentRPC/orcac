@@ -63,4 +63,9 @@ extern void (*orcac_test_after_keep)(int root_fd);
  * takes the out-of-memory path, which removes the new root.
  */
 extern int (*orcac_test_paths_fail)(int parent_fd, const char *root_name);
+/*
+ * When positive, counted down by each path allocation of the session;
+ * the allocation that brings it to zero fails.
+ */
+extern int orcac_test_alloc_fail;
 #endif

@@ -13,14 +13,24 @@
 #ifdef ORCAC_TEST_HOOKS
 void (*orcac_test_after_keep)(int root_fd) = NULL;
 int (*orcac_test_paths_fail)(int parent_fd, const char *root_name) = NULL;
+int orcac_test_alloc_fail = 0;
 #endif
 
 #define DIR_FLAGS (O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
 
+static void *alloc(size_t n) {
+#ifdef ORCAC_TEST_HOOKS
+  if (orcac_test_alloc_fail > 0 && --orcac_test_alloc_fail == 0) {
+    return NULL;
+  }
+#endif
+  return malloc(n);
+}
+
 static char *join2(const char *a, const char *b) {
   size_t na = strlen(a);
   size_t nb = strlen(b);
-  char *out = (char *)malloc(na + nb + 2u);
+  char *out = (char *)alloc(na + nb + 2u);
   if (out == NULL) {
     return NULL;
   }
@@ -32,7 +42,7 @@ static char *join2(const char *a, const char *b) {
 
 static char *dup_str(const char *s) {
   size_t n = strlen(s);
-  char *out = (char *)malloc(n + 1u);
+  char *out = (char *)alloc(n + 1u);
   if (out != NULL) {
     memcpy(out, s, n + 1u);
   }
@@ -78,17 +88,17 @@ void orcac_session_free(OrcacSessionDirs *dirs) {
  * still the pinned root, checked before anything is removed and again
  * before each removal, so a root renamed away or replaced is left alone.
  */
-static int remove_root(const OrcacSessionDirs *dirs) {
-  return orcac_remove_pinned_dir(dirs->parent_fd, dirs->root_fd,
-                                 dirs->root_name);
+static int remove_root(const OrcacSessionDirs *dirs, const char *name) {
+  return orcac_remove_pinned_dir(dirs->parent_fd, dirs->root_fd, name);
 }
 
-static int paths_fail(const OrcacSessionDirs *dirs) {
+static int paths_fail(const OrcacSessionDirs *dirs, const char *name) {
 #ifdef ORCAC_TEST_HOOKS
-  return orcac_test_paths_fail != NULL && dirs->root_name != NULL &&
-         orcac_test_paths_fail(dirs->parent_fd, dirs->root_name);
+  return orcac_test_paths_fail != NULL &&
+         orcac_test_paths_fail(dirs->parent_fd, name);
 #else
   (void)dirs;
+  (void)name;
   return 0;
 #endif
 }
@@ -102,7 +112,7 @@ int orcac_session_close(OrcacSessionDirs *dirs, char *errbuf,
   if (dirs->root != NULL && dirs->root_fd >= 0 && dirs->parent_fd >= 0) {
     close_fd(&dirs->run_fd);
     close_fd(&dirs->guess_fd);
-    if (remove_root(dirs) != 0) {
+    if (remove_root(dirs, dirs->root_name) != 0) {
       orcac_errf(errbuf, errbuf_n,
                  "orcac: could not remove session directory %s: %s",
                  dirs->root, strerror(errno));
@@ -116,24 +126,26 @@ int orcac_session_close(OrcacSessionDirs *dirs, char *errbuf,
 int orcac_session_open(const char *scratch_root, OrcacSessionDirs *dirs,
                        char *errbuf, size_t errbuf_n) {
   char root[4096];
+  const char *name;
   char *keep = NULL;
   init_dirs(dirs);
   if (orcac_make_run_dir(scratch_root, &dirs->parent_fd, &dirs->root_fd,
                          root, sizeof(root), errbuf, errbuf_n) != 0) {
     return -1;
   }
+  /* In root, so undoing the mkdirat never depends on an allocation. */
+  name = strrchr(root, '/') + 1;
   dirs->root = dup_str(root);
-  dirs->root_name = dup_str(strrchr(root, '/') + 1);
+  dirs->root_name = dup_str(name);
   dirs->run = join2(root, "run");
   dirs->guess = join2(root, "guess");
   keep = join2(root, "keep");
   dirs->keep_failed = keep != NULL ? join2(keep, "failed") : NULL;
   free(keep);
   if (dirs->root == NULL || dirs->root_name == NULL || dirs->run == NULL ||
-      dirs->guess == NULL || dirs->keep_failed == NULL || paths_fail(dirs)) {
-    if (dirs->root_name != NULL) {
-      remove_root(dirs);
-    }
+      dirs->guess == NULL || dirs->keep_failed == NULL ||
+      paths_fail(dirs, name)) {
+    remove_root(dirs, name);
     close_fd(&dirs->root_fd);
     close_fd(&dirs->parent_fd);
     free(dirs->root);

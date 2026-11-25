@@ -96,7 +96,8 @@ regular files. Guess slots are copied, renamed and removed relative to
 `guess/`. Replacing the root or any directory above it in a writable
 scratch directory therefore cannot redirect or truncate a file.
 `orcac_destroy`, and `orcac_session_open` when it fails after making
-the root, first check that the pinned parent's entry is still the pinned
+the root (whichever of its allocations fails, since the root's name is
+taken from a stack buffer), first check that the pinned parent's entry is still the pinned
 root, by device and inode, and remove nothing with `EXDEV` otherwise.
 The walk that empties the root then treats the pinned parent as the
 top of its chain, so that check is repeated before every descent and

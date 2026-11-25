@@ -693,6 +693,41 @@ static int remove_session_dirs(const char *dir) {
 }
 
 /*
+ * Whichever path allocation of orcac_session_open fails, the new root
+ * is removed again and nothing is left in the scratch directory.
+ */
+static void test_session_alloc_fail(const char *scratch) {
+  OrcacSessionDirs dirs;
+  char err[256];
+  int before = entry_count(scratch);
+  int failed = 0;
+  int opened = 0;
+
+  for (int k = 1; k <= 16 && !opened; ++k) {
+    int rc;
+    orcac_test_alloc_fail = k;
+    err[0] = '\0';
+    rc = orcac_session_open(scratch, &dirs, err, sizeof(err));
+    orcac_test_alloc_fail = 0;
+    if (rc == 0) {
+      opened = 1;
+      CHECK(orcac_session_close(&dirs, err, sizeof(err)) == 0,
+            "close after the allocations succeeded");
+      continue;
+    }
+    ++failed;
+    CHECK(strstr(err, "out of memory") != NULL,
+          "failed path allocation not reported as out of memory");
+    CHECK(entry_count(scratch) == before,
+          "session root left after a path allocation failed");
+    if (entry_count(scratch) != before) {
+      remove_session_dirs(scratch);
+    }
+  }
+  CHECK(opened && failed >= 6, "not every path allocation was failed");
+}
+
+/*
  * A session directory that fails its checks after mkdirat is removed
  * again when it is still the empty directory that was opened, and
  * nothing else under its name is touched. One that could not be opened
@@ -1283,6 +1318,7 @@ int main(int argc, char **argv) {
   test_make_run_dir(scratch);
   test_make_run_dir_discard(scratch);
   test_session_paths_oom(scratch);
+  test_session_alloc_fail(scratch);
   test_session_close_renamed(scratch);
   CHECK(entry_count(scratch) == 0, "scratch directory left non-empty");
   rmdir(scratch);
