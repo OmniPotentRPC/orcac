@@ -1,0 +1,13 @@
+/build/
+/build-*/
+/.cache/
+.pixi/
+__pycache__/
+*.pyc
+*.so
+*.so.*
+*.o
+/subprojects/*/
+!/subprojects/c-capnproto/
+!/subprojects/packagefiles/
+!/subprojects/*.wrap

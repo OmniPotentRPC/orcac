@@ -1,0 +1,6 @@
+[wrap-file]
+directory = rgconf-b6643e836abdb2891d6d0e3b74e99b2515e4cc53
+source_url = https://github.com/OmniPotentRPC/rgconf/archive/b6643e836abdb2891d6d0e3b74e99b2515e4cc53.tar.gz
+source_filename = rgconf-b6643e836abdb2891d6d0e3b74e99b2515e4cc53.tar.gz
+source_hash = 687d786f7bb8d171b896e2ede72a813f1d2941340c5149568cc60e54cb83cacf
+patch_directory = rgconf-schema
