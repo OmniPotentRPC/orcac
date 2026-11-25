@@ -382,26 +382,26 @@ static int move_back(int root_fd, int keep_fd) {
 }
 
 /*
- * renameat cannot name an inode, so between the last check and the
- * rename run/ can be swapped, and the rename then takes the decoy, or
- * keep/ can leave the root and take the files with it. What the rename
- * put in keep/failed is pinned by type, device and inode as soon as it
- * returns; the run is kept only when that pin is run_fd, keep/failed
- * still is the pin and the root's keep entry is keep_fd. Otherwise the
- * pinned object goes back to the root's run entry through the held
- * keep_fd, wherever keep/ now is, and EXDEV is returned only once that
- * entry is the pin again. Anything else is EIO, or the error of the
- * move back, so EXDEV always means that what the rename took is the
- * root's run entry again.
+ * renameat cannot name an inode and returns nothing that identifies
+ * what it moved, so between the last check and the rename run/ can be
+ * swapped for a decoy, keep/ can leave the root, and right after it
+ * keep/failed can be swapped for an impostor. The only object whose
+ * move can be proven afterwards is the one a descriptor is held on:
+ * run_fd. keep/failed is looked up by name only to compare it with
+ * run_fd by type, device and inode, never to identify anything else.
+ * The run is kept when keep/failed is run_fd and the root's keep entry
+ * is keep_fd. When keep/failed is run_fd but keep/ has left the root,
+ * it goes back to the root's run entry through keep_fd, and EXDEV is
+ * returned only once that entry is run_fd again. When keep/failed is
+ * not run_fd, nothing tells whether the rename took a decoy or what it
+ * took was replaced, so nothing is moved back and the result is EIO.
+ * So is a move back that leaves anything but run_fd as the root's run
+ * entry; a move back that fails reports its own error, EIO for EXDEV.
  */
 static int move_run_to_keep(OrcacSessionDirs *dirs) {
   int root_fd = dirs->root_fd;
   int keep_fd = dirs->keep_fd;
   struct stat run_st;
-  struct stat taken;
-  int took_run;
-  int keep_in_root;
-  int still_taken;
   if (!keep_pinned(dirs)) {
     errno = EXDEV;
     return -1;
@@ -424,24 +424,17 @@ static int move_run_to_keep(OrcacSessionDirs *dirs) {
   if (renameat(root_fd, "run", keep_fd, "failed") != 0) {
     return -1;
   }
-  if (fstatat(keep_fd, "failed", &taken, AT_SYMLINK_NOFOLLOW) != 0) {
-    errno = EIO;
-    return -1;
-  }
 #ifdef ORCAC_TEST_HOOKS
   if (orcac_test_after_move != NULL) {
     orcac_test_after_move(root_fd, keep_fd);
   }
 #endif
-  took_run = same_object(&taken, &run_st);
-  still_taken = entry_is_pin(keep_fd, "failed", &taken);
-  keep_in_root = entry_is_fd(root_fd, "keep", keep_fd);
-  if (took_run && still_taken && keep_in_root) {
-    return 0;
-  }
-  if (!still_taken) {
+  if (!entry_is_pin(keep_fd, "failed", &run_st)) {
     errno = EIO;
     return -1;
+  }
+  if (entry_is_fd(root_fd, "keep", keep_fd)) {
+    return 0;
   }
   if (move_back(root_fd, keep_fd) != 0) {
     if (errno == EXDEV) {
@@ -449,7 +442,7 @@ static int move_run_to_keep(OrcacSessionDirs *dirs) {
     }
     return -1;
   }
-  if (!entry_is_pin(root_fd, "run", &taken)) {
+  if (!entry_is_pin(root_fd, "run", &run_st)) {
     errno = EIO;
     return -1;
   }

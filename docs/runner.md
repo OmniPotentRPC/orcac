@@ -111,34 +111,39 @@ empty private directory of the same user swapped in passes those checks;
 nothing can tell it from the one made.
 
 A failed run moves to `keep/failed` with one `renameat` between the
-pinned root and the pinned `keep/`, made only while the root's `run` and
-`keep` entries are still those descriptors by device and inode; a
+pinned root and the pinned `keep/`, made only while the root's `run`
+and `keep` entries are still those descriptors by device and inode; a
 `keep/` renamed away or replaced by a symlink or another directory gets
 nothing, the call fails with `EXDEV` and the files stay in `run/`.
-`renameat` cannot name an inode, so whatever the rename put in
-`keep/failed` is pinned by type, device and inode as soon as it returns.
-The run counts as kept only when that pin is the pinned `run/`,
-`keep/failed` is still the pin and the root's `keep` entry is still the
-pinned `keep/`. Otherwise, when `run/` was swapped for a decoy in the
-window between the last check and the rename, or `keep/` left the root,
-the pinned object is renamed back to the root's `run` entry through the
-held `keep/` descriptor, wherever `keep/` went, and the call fails with
-`EXDEV` only once the root's `run` entry is the pin again. `EXDEV`
-therefore means that what the rename took is back as `run/`: the run's
-own files when `keep/` left the root, the decoy when `run/` was swapped.
-In the decoy case the run's files were moved away before the rename by
-whoever swapped `run/`, and the call does not bring them back. When
-`keep/failed` is no longer the pin, nothing is renamed back and the call
-fails with `EIO`. When the rename back fails the call fails with its
-error, `EIO` in place of `EXDEV`, and when it succeeds but the root's
-`run` entry is not the pin afterwards it fails with `EIO`. In those
-cases the pinned object is wherever it was left: in `keep/failed`, in a
-`keep/` that left the root, or wherever it was taken. After every call
-the session's `run/` descriptor is kept only while it is still the
-root's `run` entry; otherwise it is replaced only by a `run/` the call
-made itself and that passes the checks above, or left closed for the
-next call to make again, and never opened on a non-empty, shared or
-foreign entry someone else put there.
+`renameat` cannot name an inode and returns nothing that identifies
+what it moved, and a lookup of `keep/failed` by name can return
+something swapped in right after the rename. The only object whose move
+can be proven is the one the session holds a descriptor on, its own
+`run/`, so `keep/failed` and the root's `run` entry are only ever
+compared with that descriptor by type, device and inode, and nothing
+found by name is trusted to be what the rename took. The run counts as
+kept when, after the rename, `keep/failed` is the session's `run/` and
+the root's `keep` entry is still the pinned `keep/`. When `keep/failed`
+is the session's `run/` but `keep/` left the root, it is renamed back
+to the root's `run` entry through the held `keep/` descriptor, wherever
+`keep/` went, and the call fails with `EXDEV` only once the root's `run`
+entry is the session's `run/` again. `EXDEV` therefore means that
+nothing moved, or that the run's own files are `run/` again. When
+`keep/failed` is not the session's `run/`, the rename took a decoy put
+in place of `run/` before it, or what it took was replaced right after
+it, and no POSIX call tells which: nothing is renamed back, whatever is
+in `keep/failed` stays there, and the call fails with `EIO`. When the
+rename back fails the call fails with its error, `EIO` in place of
+`EXDEV`, and when it succeeds but the root's `run` entry is not the
+session's `run/` afterwards, as when `keep/failed` was replaced between
+the check and the rename back, it fails with `EIO`. In those cases the
+run's files are wherever they were left: in `keep/failed`, in a `keep/`
+that left the root, or wherever whoever swapped `run/` or `keep/failed`
+moved them. After every call the session's `run/` descriptor is kept
+only while it is still the root's `run` entry; otherwise it is replaced
+only by a `run/` the call made itself and that passes the checks above,
+or left closed for the next call to make again, and never opened on a
+non-empty, shared or foreign entry someone else put there.
 
 The deck and ORCA's stdout and stderr are created with
 `openat(..., O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC)` in the pinned

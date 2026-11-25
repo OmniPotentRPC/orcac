@@ -82,22 +82,31 @@ int orcac_session_reset_run(OrcacSessionDirs *dirs, char *errbuf,
  * made only while the root's entries run and keep are still run_fd and
  * keep_fd, by device and inode: a keep/ or run/ renamed away, or
  * replaced by a symlink or another directory, is -1 with EXDEV and
- * nothing moves. What the rename put in keep/failed is pinned by type,
- * device and inode as soon as it returns. The run is kept only when the
- * pin is run_fd, keep/failed is still the pin and the root's keep entry
- * is keep_fd. Otherwise, with run/ swapped for a decoy before the
- * rename or keep/ gone from the root after it, the pinned object is
- * renamed back to the root's run entry through keep_fd, wherever keep/
- * now is, and the result is -1 with EXDEV only once that entry is the
- * pin again: EXDEV means that what the rename took is back as run/,
- * not that the run's files never left the tree, since a decoy taken
- * means run/ had already been moved away by someone else. The result is
- * -1 with EIO, and nothing is renamed back, when keep/failed is no
- * longer the pin, as when something took it and left another object
- * there; -1 with EIO when, after the move back, the root's run entry is
- * not the pin; and -1 with the error of the move back when that fails
- * (EIO for EXDEV). In those cases the pinned object is wherever it was
- * left: in keep/failed, in a keep/ that left the root, or taken away.
+ * nothing moves.
+ *
+ * renameat cannot name an inode and returns nothing that identifies
+ * what it moved, and a lookup of keep/failed by name can return
+ * something swapped in after it. So the only object whose move is ever
+ * proven is run_fd's, by comparing keep/failed and the root's run entry
+ * with it by type, device and inode; nothing found by name is trusted to
+ * be what the rename took. 0 means that after the rename keep/failed
+ * was run_fd and the root's keep entry was keep_fd. When keep/failed is
+ * run_fd but keep/ has left the root, it is renamed back to the root's
+ * run entry through keep_fd, wherever keep/ now is, and the result is
+ * -1 with EXDEV only once that entry is run_fd again: EXDEV after the
+ * rename means that the run's own run/ is the root's run entry again.
+ * When keep/failed is not run_fd, the rename took a decoy put in place
+ * of run/ before it, or what it took was replaced right after it, and
+ * no POSIX call tells which: nothing is renamed back, whatever is in
+ * keep/failed stays there, and the result is -1 with EIO. The result is
+ * also -1 with EIO when, after the move back, the root's run entry is
+ * not run_fd, as when something replaced keep/failed between the check
+ * and the move back and that is what landed as run/; and -1 with the
+ * error of the move back when that fails (EIO for EXDEV). In those
+ * cases the run's files are wherever they were left: in keep/failed, in
+ * a keep/ that left the root, or wherever whoever swapped run/ or
+ * keep/failed moved them.
+ *
  * run_fd stays open only while it is still the root's run entry;
  * otherwise it is closed and replaced only by a run/ this call made
  * and that passes the checks above, else -1, so it is never opened on
@@ -117,8 +126,8 @@ extern void (*orcac_test_after_keep)(int root_fd);
  */
 extern void (*orcac_test_before_keep)(int root_fd, int keep_fd);
 /*
- * Called by orcac_session_keep_run once its renameat has succeeded and
- * what it moved is pinned, before the identity checks that follow.
+ * Called by orcac_session_keep_run as soon as its renameat has
+ * succeeded, before anything is looked up.
  */
 extern void (*orcac_test_after_move)(int root_fd, int keep_fd);
 /*

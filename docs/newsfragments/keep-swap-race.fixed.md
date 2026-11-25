@@ -1,19 +1,20 @@
-Moving a failed run to `keep/failed` now pins what the `renameat` put
-there, by type, device and inode, as soon as it returns, and keeps the
-run only when that is the pinned `run/`, still in `keep/failed`, with
-`keep/` still in the root. Before, a `run/` swapped for a decoy right
-before the rename left the decoy in `keep/failed`, and a `keep/` that
-left the root when the files could not be moved back was reported as
-`EXDEV`. Anything else the rename took, the run's files in a `keep/`
-that left the root or a decoy, is now renamed back to the root's `run`
-entry, and `EXDEV` is returned only once that entry is the pinned
-object again; for a decoy the run's files are wherever whoever swapped
-`run/` moved them. A `keep/failed` that no longer holds the pinned
-object is not moved back and fails with `EIO`, as does a move back that
-leaves another object as `run/`; a move back that fails reports its own
-error, `EIO` in place of `EXDEV`. The pinned object then stays where it
-was left, and the session's `run/` descriptor is never reopened by name
-on an entry it did not make or verify.
+Moving a failed run to `keep/failed` no longer trusts anything found by
+name to be what the `renameat` moved. `renameat` returns nothing that
+identifies what it moved, and `keep/failed` can be swapped right after
+it, so the only object whose move is proven is the session's own
+`run/`, through the descriptor held on it. The run is kept only when
+`keep/failed` is that `run/` and `keep/` is still in the root. Before,
+`keep/failed` was looked up by name after the rename and whatever was
+found was trusted: an impostor swapped in at that point was renamed
+back as `run/` and reported as `EXDEV`, and a decoy swapped for `run/`
+before the rename was also renamed back and reported as `EXDEV`. Now a
+`keep/failed` that is not the session's `run/` is never renamed back,
+since no POSIX call tells a decoy the rename took from something swapped
+in after it, and the call fails with `EIO`. Only the run's own `run/`
+is renamed back when `keep/` left the root, and `EXDEV` is returned only
+once the root's `run` entry is that `run/` again. A move back that fails
+reports its own error, `EIO` in place of `EXDEV`, and one that leaves
+anything else as `run/` fails with `EIO`.
 
 A `run/`, `guess/` or `keep/` the session makes, including the `run/`
 made again after a keep or a reset, could be swapped between its
