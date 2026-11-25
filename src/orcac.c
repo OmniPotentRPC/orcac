@@ -220,10 +220,7 @@ int orcac_configure(OrcaCPot *pot, const OrcaCConfig *config) {
   }
   orcac_free_config(&pot->config);
   pot->config = next;
-  pot->has_guess = 0;
-  free(pot->guess_atomic_numbers);
-  pot->guess_atomic_numbers = NULL;
-  pot->guess_n_atoms = 0;
+  orcac_cache_clear(&pot->guesses, pot->run_dir);
   if (pot->run_dir != NULL) {
     orcac_remove_tree(pot->run_dir);
     free(pot->run_dir);
@@ -251,10 +248,10 @@ OrcaCResult orcac_compute(OrcaCPot *pot, int n_atoms, const double *positions_an
   char *err = NULL;
   char *engrad = NULL;
   char *gbw = NULL;
-  char *guess = NULL;
+  char guess_name[ORCAC_GUESS_NAME_SIZE];
   OrcacChildResult child;
   OrcacEngrad parsed;
-  int use_guess;
+  int guess_slot = -1;
 
   memset(&ok, 0, sizeof(ok));
   memset(&parsed, 0, sizeof(parsed));
@@ -280,23 +277,17 @@ OrcaCResult orcac_compute(OrcaCPot *pot, int n_atoms, const double *positions_an
   err = join_path2(pot->run_dir, "orcac.err");
   engrad = join_path2(pot->run_dir, "orcac.engrad");
   gbw = join_path2(pot->run_dir, "orcac.gbw");
-  guess = join_path2(pot->run_dir, "orcac_guess.gbw");
-  if (inp == NULL || out == NULL || err == NULL || engrad == NULL || gbw == NULL ||
-      guess == NULL) {
+  if (inp == NULL || out == NULL || err == NULL || engrad == NULL || gbw == NULL) {
     orcac_set_error(pot, "orcac: out of memory for run file paths");
     goto fail;
   }
 
-  use_guess = 0;
-  if (pot->config.reuse_moread && pot->has_guess &&
-      pot->guess_n_atoms == (size_t)n_atoms && access(guess, R_OK) == 0) {
-    use_guess = 1;
-    for (int i = 0; i < n_atoms; ++i) {
-      if (pot->guess_atomic_numbers[i] != atomic_numbers[i]) {
-        use_guess = 0;
-        break;
-      }
-    }
+  if (pot->config.reuse_moread) {
+    guess_slot = orcac_cache_lookup(&pot->guesses, pot->run_dir, NULL,
+                                    n_atoms, atomic_numbers);
+  }
+  if (guess_slot >= 0) {
+    orcac_cache_slot_name(guess_slot, guess_name);
   }
 
   if (safe_unlink(engrad) != 0 || safe_unlink(gbw) != 0) {
@@ -305,7 +296,7 @@ OrcaCResult orcac_compute(OrcaCPot *pot, int n_atoms, const double *positions_an
   }
 
   if (orcac_render_input(&pot->config, n_atoms, positions_ang, atomic_numbers,
-                         use_guess ? "orcac_guess.gbw" : NULL,
+                         guess_slot >= 0 ? guess_name : NULL,
                          &input_text, pot->last_error,
                          sizeof(pot->last_error)) != 0) {
     goto fail;
@@ -373,44 +364,14 @@ OrcaCResult orcac_compute(OrcaCPot *pot, int n_atoms, const double *positions_an
   }
 
   if (pot->config.reuse_moread && access(gbw, R_OK) == 0) {
-    FILE *in = fopen(gbw, "rb");
-    FILE *outf = fopen(guess, "wb");
-    if (in != NULL && outf != NULL) {
-      char buf[4096];
-      size_t got;
-      while ((got = fread(buf, 1u, sizeof(buf), in)) > 0) {
-        fwrite(buf, 1u, got, outf);
-      }
-      fclose(in);
-      fclose(outf);
-      free(pot->guess_atomic_numbers);
-      pot->guess_atomic_numbers = (int *)malloc((size_t)n_atoms * sizeof(int));
-      if (pot->guess_atomic_numbers != NULL) {
-        memcpy(pot->guess_atomic_numbers, atomic_numbers,
-               (size_t)n_atoms * sizeof(int));
-        pot->guess_n_atoms = (size_t)n_atoms;
-        pot->has_guess = 1;
-      } else {
-        pot->has_guess = 0;
-      }
-    } else {
-      if (in != NULL) {
-        fclose(in);
-      }
-      if (outf != NULL) {
-        fclose(outf);
-      }
-      pot->has_guess = 0;
-    }
+    orcac_cache_store(&pot->guesses, pot->run_dir, gbw, NULL, n_atoms,
+                      atomic_numbers);
   }
 
   goto done;
 
 fail:
-  pot->has_guess = 0;
-  free(pot->guess_atomic_numbers);
-  pot->guess_atomic_numbers = NULL;
-  pot->guess_n_atoms = 0;
+  orcac_cache_drop(&pot->guesses, pot->run_dir, guess_slot);
 
   stderr_tail = err ? orcac_file_tail(err, ORCAC_TAIL_BYTES) : NULL;
   stdout_tail = out ? orcac_file_tail(out, ORCAC_TAIL_BYTES) : NULL;
@@ -441,7 +402,6 @@ done:
   free(err);
   free(engrad);
   free(gbw);
-  free(guess);
   orcac_free_engrad(&parsed);
   return ok;
 }
@@ -458,7 +418,7 @@ void orcac_destroy(OrcaCPot *pot) {
     orcac_remove_tree(pot->run_dir);
   }
   orcac_free_config(&pot->config);
-  free(pot->guess_atomic_numbers);
+  orcac_cache_free(&pot->guesses);
   free(pot->run_dir);
   free(pot->resolved_exe);
   free(pot);

@@ -2,6 +2,8 @@
 
 #include <orcac.h>
 
+#include "orcac_cache.h"
+
 #include <stddef.h>
 
 #define ORCAC_LAST_ERROR_SIZE 4096
@@ -11,9 +13,7 @@ struct OrcaCPot {
   char *run_dir;
   char *resolved_exe;
   char last_error[ORCAC_LAST_ERROR_SIZE];
-  int has_guess;
-  int *guess_atomic_numbers;
-  size_t guess_n_atoms;
+  OrcacGuessCache guesses;
 };
 
 void orcac_set_error(OrcaCPot *pot, const char *fmt, ...);

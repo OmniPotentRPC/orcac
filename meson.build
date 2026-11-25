@@ -24,6 +24,7 @@ liborcac = library(
   'orcac',
   [
     'src/orcac.c',
+    'src/orcac_cache.c',
     'src/orca_input.c',
     'src/orca_parse.c',
     'src/orca_runner.c',

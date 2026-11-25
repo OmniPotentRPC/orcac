@@ -223,7 +223,7 @@ int main(int argc, char **argv) {
     return fail("missing first input keyword line");
   }
   if (strstr(text, "! HF STO-3G TightSCF EnGrad MORead\n") == NULL ||
-      strstr(text, "%moinp \"orcac_guess.gbw\"") == NULL ||
+      strstr(text, "%moinp \"orcac_guess0.gbw\"") == NULL ||
       strstr(text, "%pal nprocs 2 end\n") == NULL ||
       strstr(text, "%maxcore 400\n") == NULL) {
     return fail("missing MORead, %pal or %maxcore lines");
