@@ -1346,6 +1346,52 @@ static int names_fd(int dirfd, const char *name, int fd) {
          S_ISDIR(b.st_mode) && a.st_dev == b.st_dev && a.st_ino == b.st_ino;
 }
 
+static char late_moved_run[PATH_MAX + 32];
+static int late_calls = 0;
+
+/*
+ * Once run/ has passed its entry check, move it out and put an empty
+ * private directory in its place, before its emptiness is read.
+ */
+static void swap_run_before_empty(int dirfd, const char *name) {
+  if (strcmp(name, "run") != 0 || late_calls++ != 0) {
+    return;
+  }
+  CHECK(renameat(dirfd, "run", AT_FDCWD, late_moved_run) == 0 &&
+            mkdirat(dirfd, "run", 0700) == 0,
+        "swap run/ after its entry check");
+}
+
+/*
+ * A run/ swapped after its entry is checked and before it is read is
+ * not kept: the descriptor would be on a directory that left the root.
+ */
+static void test_session_run_swapped_late(const char *scratch) {
+  OrcacSessionDirs dirs;
+  char err[256];
+  int before = entry_count(scratch);
+
+  snprintf(late_moved_run, sizeof(late_moved_run), "%s/late-run", scratch);
+  late_calls = 0;
+  orcac_test_private_dir_hook = swap_run_before_empty;
+  err[0] = '\0';
+  CHECK(orcac_session_open(scratch, &dirs, err, sizeof(err)) != 0 &&
+            strstr(err, "could not create the scratch layout") != NULL &&
+            strstr(err, strerror(EIO)) != NULL,
+        "session opened with run/ swapped after its entry check");
+  orcac_test_private_dir_hook = NULL;
+  CHECK(late_calls == 1, "late run/ hook not called");
+  if (dirs.root != NULL) {
+    CHECK(names_fd(dirs.root_fd, "run", dirs.run_fd),
+          "run_fd on a run/ that left the root");
+    CHECK(orcac_session_close(&dirs, err, sizeof(err)) == 0,
+          "close after a late run/ swap");
+  }
+  CHECK(entry_count(late_moved_run) == 0, "moved run/ touched");
+  CHECK(rmdir(late_moved_run) == 0, "remove the moved run/");
+  CHECK(entry_count(scratch) == before, "scratch not back to its entries");
+}
+
 static char reopen_moved_run[PATH_MAX + 32];
 static int reopen_swap = 0;
 static int reopen_calls = 0;
@@ -2527,6 +2573,7 @@ int main(int argc, char **argv) {
   test_session_alloc_fail(scratch);
   test_session_close_renamed(scratch);
   test_session_remove_reopen(scratch);
+  test_session_run_swapped_late(scratch);
   test_keep_replaced(scratch);
   test_keep_moved_in_window(scratch);
   test_keep_run_swapped_in_window(scratch);

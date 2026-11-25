@@ -216,21 +216,36 @@ static int dir_is_empty(int fd) {
   return empty;
 }
 
-int orcac_check_private_dir(int dirfd, const char *name, int fd,
-                            int need_empty) {
+/*
+ * 1 while fd is a private directory of this user, name's entry in
+ * dirfd, 0 when it is not, -1 when either cannot be read.
+ */
+static int private_entry(int dirfd, const char *name, int fd) {
   struct stat parent;
   struct stat st;
   struct stat entry;
-  int empty;
   if (fstat(dirfd, &parent) != 0 || fstat(fd, &st) != 0) {
     return -1;
   }
-  if (!S_ISDIR(st.st_mode) || st.st_dev != parent.st_dev ||
-      st.st_uid != geteuid() || (st.st_mode & 077) != 0 ||
-      fstatat(dirfd, name, &entry, AT_SYMLINK_NOFOLLOW) != 0 ||
-      (entry.st_mode & S_IFMT) != (st.st_mode & S_IFMT) ||
-      entry.st_dev != st.st_dev || entry.st_ino != st.st_ino) {
-    errno = EIO;
+  return S_ISDIR(st.st_mode) && st.st_dev == parent.st_dev &&
+         st.st_uid == geteuid() && (st.st_mode & 077) == 0 &&
+         fstatat(dirfd, name, &entry, AT_SYMLINK_NOFOLLOW) == 0 &&
+         (entry.st_mode & S_IFMT) == (st.st_mode & S_IFMT) &&
+         entry.st_dev == st.st_dev && entry.st_ino == st.st_ino;
+}
+
+/*
+ * Reading the directory takes time in which the entry can be swapped,
+ * so after the emptiness check the entry is checked again.
+ */
+int orcac_check_private_dir(int dirfd, const char *name, int fd,
+                            int need_empty) {
+  int ok = private_entry(dirfd, name, fd);
+  int empty;
+  if (ok != 1) {
+    if (ok == 0) {
+      errno = EIO;
+    }
     return -1;
   }
   if (!need_empty) {
@@ -244,6 +259,13 @@ int orcac_check_private_dir(int dirfd, const char *name, int fd,
   empty = dir_is_empty(fd);
   if (empty != 1) {
     if (empty == 0) {
+      errno = EIO;
+    }
+    return -1;
+  }
+  ok = private_entry(dirfd, name, fd);
+  if (ok != 1) {
+    if (ok == 0) {
       errno = EIO;
     }
     return -1;

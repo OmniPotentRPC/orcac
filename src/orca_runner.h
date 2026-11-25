@@ -54,7 +54,8 @@ int orcac_make_run_dir(const char *scratch_root,
 /*
  * 0 while the directory open at fd is name's entry in dirfd, by type,
  * device and inode, on dirfd's device, owned by this user, without
- * group or other access and, when need_empty is set, empty. Otherwise
+ * group or other access and, when need_empty is set, empty, with the
+ * entry checked again after the directory is read. Otherwise
  * -1 with EIO, or with the error that kept either from being read. fd
  * is left open either way.
  */
