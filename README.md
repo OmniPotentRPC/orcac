@@ -64,6 +64,11 @@ including the tails of ORCA's stderr and stdout.
 | `timeout_s` | wall-clock limit per ORCA run in seconds | 3600 |
 | `reuse_moread` | reuse the last `.gbw` through `%moinp` and `MORead` | 1 |
 
+On timeout the process group gets SIGTERM, then SIGKILL if it has not
+exited within 2 s. Each instance runs in its own run directory, which
+`orcac_configure` and `orcac_destroy` remove together with every file ORCA
+left in it.
+
 ## Build and test
 
 ```sh
@@ -72,6 +77,14 @@ meson compile -C build
 meson test -C build --print-errorlogs
 python3 scripts/build_docs.py
 ```
+
+The tests use a fake `orca` script and synthetic fixtures under
+`tests/data/orca`. They are hand-written in ORCA's output layout and were
+not produced by an ORCA run. No test needs ORCA. The optional
+`optional-orca` suite runs a real H2 single point when `ORCA_BIN` names a
+licensed local ORCA install, and skips otherwise. ORCA's EULA does not allow
+installing it on shared CI runners, so CI only runs that lane when the
+`ORCA_BIN` repository variable points at an existing install.
 
 ## Install
 
@@ -86,6 +99,9 @@ pkg-config --cflags --libs orcac
 ```
 
 Only the functions above are exported from `liborcac.so`.
+
+See [docs/porting.md](docs/porting.md) for how orcac relates to rgpot's
+in-tree ORCA support.
 
 ## License
 

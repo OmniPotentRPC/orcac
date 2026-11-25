@@ -15,3 +15,6 @@ bind directly. A loader should check `orcac_c_abi_version()` against
 
 Positions go in as Angstrom. `orcac_compute` returns energy in Hartree and
 forces in Hartree/Bohr, with forces the negative ORCA gradient.
+
+`orcac_compute` keeps a per-instance scratch directory and reuses the previous
+`.gbw` as a MORead guess when topology and options are unchanged.
