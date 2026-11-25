@@ -1,5 +1,6 @@
 #include "orca_parse.h"
 #include "orcac_errbuf.h"
+#include "orcac_locale.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -177,7 +178,7 @@ static int parse_double(const char *token, double *out) {
     }
   }
   errno = 0;
-  v = strtod(token, &end);
+  orcac_strtod_c(token, &end, &v);
   if (end == token || *end != '\0' || !isfinite(v) ||
       (errno == ERANGE && fabs(v) > 1.0)) {
     return -1;

@@ -27,6 +27,7 @@ liborcac_sources = files(
   'src/orcac_session.c',
   'src/orca_input.c',
   'src/orca_parse.c',
+  'src/orcac_locale.c',
   'src/orca_runner.c',
 )
 
@@ -85,6 +86,14 @@ if get_option('with_tests')
        args: [meson.current_source_dir()],
        timeout: 120)
 
+  test_layout = executable(
+    'test_orcac_layout',
+    'tests/test_orcac_layout.c',
+    include_directories: inc,
+    c_args: common_c_args,
+  )
+  test('abi_layout', test_layout)
+
   test_internal = executable(
     'test_orcac_internal',
     ['tests/test_orcac_internal.c', liborcac_sources],
@@ -98,7 +107,7 @@ if get_option('with_tests')
 
   test_parse = executable(
     'test_orca_parse',
-    ['tests/test_orca_parse.c', 'src/orca_parse.c'],
+    ['tests/test_orca_parse.c', 'src/orca_parse.c', 'src/orcac_locale.c'],
     include_directories: [inc, include_directories('src')],
     c_args: common_c_args,
   )

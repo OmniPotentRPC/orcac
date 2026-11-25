@@ -19,7 +19,10 @@
  *
  * Ownership: the library never keeps a caller pointer past the call
  * that received it. Strings in OrcaCConfig are copied by orcac_create
- * and orcac_configure. Out-parameters are written only on ORCAC_OK.
+ * and orcac_configure. energy_h and gradient_h_bohr are written only on
+ * ORCAC_OK. OrcaCResult is written on ORCAC_OK and on every failure
+ * status except when struct_size is below ORCAC_RESULT_MIN_SIZE, where
+ * the call returns ORCAC_E_INVALID and leaves it untouched.
  *
  * Threads: a session runs one call at a time. A second call on the same
  * session while one is running returns ORCAC_E_BUSY at once instead of
@@ -123,7 +126,7 @@ typedef struct OrcaCConfig {
   uint32_t magic;          /**< ORCAC_CONFIG_MAGIC */
   uint32_t version;        /**< ORCAC_CONFIG_VERSION */
   size_t struct_size;      /**< bytes the caller allocated for this struct */
-  const char *method;      /**< `!` line method; NULL is "HF" */
+  const char *method;      /**< `!` line method; NULL is "HF", "" is invalid */
   const char *basis;       /**< `!` line basis; NULL is "STO-3G", "" omits */
   const char *keywords;    /**< extra `!` words; one line, NULL omits */
   const char *blocks;      /**< user % blocks, validated; NULL omits */
