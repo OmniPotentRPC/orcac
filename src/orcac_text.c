@@ -204,6 +204,25 @@ static void append_tokens(sbuf *sb, const char *text, int *engrad) {
   }
 }
 
+/* Shortest text that reads back as exactly this binary64 value, so ORCA sees
+ * the coordinates the caller asked for. A plain decimal keeps at least ten
+ * places so short values stay in the usual fixed layout. Call inside a C
+ * locale scope; out holds at least 48 bytes. */
+static void coordinate_text(double value, char out[48]) {
+  for (int precision = 1; precision <= 17; ++precision) {
+    snprintf(out, 48, "%.*g", precision, value);
+    if (strtod(out, NULL) == value)
+      break;
+  }
+  if (strpbrk(out, "eE"))
+    return;
+  if (!strchr(out, '.'))
+    strcat(out, ".");
+  const size_t decimals = strlen(strchr(out, '.') + 1);
+  for (size_t k = decimals; k < 10; ++k)
+    strcat(out, "0");
+}
+
 char *orcac_render(const orcac_config *cfg, int n_atoms, const double *pos_ang,
                    const int *atomic_numbers, const char *moinp, char *err,
                    size_t errlen) {
@@ -269,9 +288,12 @@ char *orcac_render(const orcac_config *cfg, int n_atoms, const double *pos_ang,
   }
   sb_printf(&sb, "* xyz %d %d\n", cfg->charge, cfg->multiplicity);
   for (int i = 0; i < n_atoms; ++i) {
-    sb_printf(&sb, "%-2s %18.10f %18.10f %18.10f\n",
-              orcac_element_symbol(atomic_numbers[i]), pos_ang[3 * i],
-              pos_ang[3 * i + 1], pos_ang[3 * i + 2]);
+    char x[48], y[48], z[48];
+    coordinate_text(pos_ang[3 * i], x);
+    coordinate_text(pos_ang[3 * i + 1], y);
+    coordinate_text(pos_ang[3 * i + 2], z);
+    sb_printf(&sb, "%-2s %18s %18s %18s\n",
+              orcac_element_symbol(atomic_numbers[i]), x, y, z);
   }
   sb_puts(&sb, "*\n");
   c_locale_leave(&scope);
