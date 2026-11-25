@@ -1,0 +1,1 @@
+First release of `liborcac`, the ORCA engine shim for rgpot: an ORCA 6.1 (and 5.0.4) EnGrad single point through a child process with a timeout and process-group cleanup, configured by `ORCAParams`, `PotentialConfig.orca` or `PotentialSpec.orca` from the rgconf schema, with orbital reuse between steps, Capabilities reporting, and `orcac.pc`.
