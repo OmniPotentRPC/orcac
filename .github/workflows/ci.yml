@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build pkg-config python3
+      - name: Configure
+        run: meson setup build
+      - name: Build
+        run: meson compile -C build
+      - name: Test
+        run: meson test -C build --print-errorlogs
+      - name: Build docs
+        run: python3 scripts/build_docs.py
+
+  orca-optional:
+    if: ${{ vars.ORCA_BIN != '' }}
+    runs-on: ubuntu-latest
+    env:
+      ORCA_BIN: ${{ vars.ORCA_BIN }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build pkg-config python3
+      - name: Configure
+        run: meson setup build-real
+      - name: Build
+        run: meson compile -C build-real
+      - name: ORCA replay path
+        run: meson test -C build-real --print-errorlogs
