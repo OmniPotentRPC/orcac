@@ -58,8 +58,11 @@ int orcac_session_close(OrcacSessionDirs *dirs, char *errbuf,
  * kept in use: dirs is freed only on success. On -1, with the reason
  * in errbuf, the paths and the pinned parent and root stay as they
  * were, and run/, guess/ and keep/ are made again where the removal
- * took them, with run_fd, guess_fd and keep_fd reopened (-1 if that
- * failed).
+ * took them, with run_fd, guess_fd and keep_fd reopened. One made again
+ * is checked as above. One the removal left may hold entries, but is
+ * reopened only while it is the root's entry, a directory on the
+ * root's device, owned by this user and without group or other access.
+ * Each that fails is left in place and its descriptor is -1.
  */
 int orcac_session_remove(OrcacSessionDirs *dirs, char *errbuf,
                          size_t errbuf_n);

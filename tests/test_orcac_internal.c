@@ -1337,6 +1337,114 @@ static void test_session_close_renamed(const char *scratch) {
   CHECK(entry_count(scratch) == before, "scratch not back to its entries");
 }
 
+/* 1 while name in dirfd is the directory open at fd. */
+static int names_fd(int dirfd, const char *name, int fd) {
+  struct stat a;
+  struct stat b;
+  return fd >= 0 && fstat(fd, &a) == 0 &&
+         fstatat(dirfd, name, &b, AT_SYMLINK_NOFOLLOW) == 0 &&
+         S_ISDIR(b.st_mode) && a.st_dev == b.st_dev && a.st_ino == b.st_ino;
+}
+
+static char reopen_moved_run[PATH_MAX + 32];
+static int reopen_swap = 0;
+static int reopen_calls = 0;
+
+/*
+ * Fail the removal with EIO, first changing the layout: with
+ * reopen_swap, run/ is moved out for a directory open to others,
+ * guess/ is opened to the group and keep/ is left holding a file;
+ * without it, run/ is taken away.
+ */
+static int change_layout_then_fail(const OrcacSessionDirs *dirs) {
+  int ok;
+  ++reopen_calls;
+  if (reopen_swap) {
+    int fd;
+    ok = renameat(dirs->root_fd, "run", AT_FDCWD, reopen_moved_run) == 0 &&
+         mkdirat(dirs->root_fd, "run", 0700) == 0 &&
+         fchmodat(dirs->root_fd, "run", 0755, 0) == 0 &&
+         fchmodat(dirs->root_fd, "guess", 0750, 0) == 0;
+    fd = openat(dirs->root_fd, "keep/left",
+                O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    ok = ok && fd >= 0;
+    if (fd >= 0) {
+      close(fd);
+    }
+  } else {
+    ok = unlinkat(dirs->root_fd, "run", AT_REMOVEDIR) == 0;
+  }
+  CHECK(ok, "change the layout before the removal fails");
+  return EIO;
+}
+
+/*
+ * After a failed orcac_session_remove, a run/, guess/ or keep/ the
+ * removal took is made and opened again, and one it left is reopened,
+ * even holding entries, only while it is still a private directory of
+ * this user: one swapped in or opened to others is left in place with
+ * its descriptor -1.
+ */
+static void test_session_remove_reopen(const char *scratch) {
+  OrcacSessionDirs dirs;
+  char err[256];
+  char keep[PATH_MAX + 32];
+  struct stat st;
+  int before = entry_count(scratch);
+
+  snprintf(reopen_moved_run, sizeof(reopen_moved_run), "%s/reopen-run",
+           scratch);
+  for (int swap = 0; swap <= 1; ++swap) {
+    CHECK(orcac_session_open(scratch, &dirs, err, sizeof(err)) == 0,
+          "open for a failed removal");
+    if (dirs.root == NULL) {
+      return;
+    }
+    reopen_swap = swap;
+    reopen_calls = 0;
+    orcac_test_remove_fail = change_layout_then_fail;
+    err[0] = '\0';
+    CHECK(orcac_session_remove(&dirs, err, sizeof(err)) != 0 &&
+              strstr(err, strerror(EIO)) != NULL,
+          "removal did not fail");
+    orcac_test_remove_fail = NULL;
+    CHECK(reopen_calls == 1, "removal hook not called");
+    CHECK(dirs.root != NULL && dirs.root_fd >= 0,
+          "session freed after a failed removal");
+    if (dirs.root == NULL) {
+      return;
+    }
+    CHECK(dirs.keep_fd >= 0 && names_fd(dirs.root_fd, "keep", dirs.keep_fd),
+          "kept keep/ not reopened");
+    if (swap) {
+      CHECK(dirs.run_fd < 0, "run_fd opened on a run/ open to others");
+      CHECK(dirs.guess_fd < 0, "guess_fd opened on a guess/ open to the group");
+      snprintf(keep, sizeof(keep), "%s/keep", dirs.root);
+      CHECK(file_is(keep, "left", ""), "file in keep/ touched");
+      CHECK(fstatat(dirs.root_fd, "run", &st, AT_SYMLINK_NOFOLLOW) == 0 &&
+                (st.st_mode & 0777) == 0755,
+            "swapped-in run/ not left in place");
+      CHECK(fstatat(dirs.root_fd, "guess", &st, AT_SYMLINK_NOFOLLOW) == 0 &&
+                (st.st_mode & 0777) == 0750,
+            "guess/ open to the group not left in place");
+      CHECK(fchmodat(dirs.root_fd, "guess", 0700, 0) == 0,
+            "close guess/ again");
+      CHECK(rmdir(reopen_moved_run) == 0, "remove the moved run/");
+    } else {
+      CHECK(dirs.run_fd >= 0 && names_fd(dirs.root_fd, "run", dirs.run_fd) &&
+                entry_count(dirs.run) == 0,
+            "run/ the removal took not made again");
+      CHECK(dirs.guess_fd >= 0 &&
+                names_fd(dirs.root_fd, "guess", dirs.guess_fd),
+            "guess/ the removal left not reopened");
+    }
+    CHECK(orcac_session_close(&dirs, err, sizeof(err)) == 0,
+          "close after a failed removal");
+  }
+  reopen_swap = 0;
+  CHECK(entry_count(scratch) == before, "scratch not back to its entries");
+}
+
 /*
  * A failed run is moved only into the keep/ pinned when the session was
  * made: a keep/ replaced by another directory or by a symlink, or
@@ -2412,6 +2520,7 @@ int main(int argc, char **argv) {
   test_session_paths_oom(scratch);
   test_session_alloc_fail(scratch);
   test_session_close_renamed(scratch);
+  test_session_remove_reopen(scratch);
   test_keep_replaced(scratch);
   test_keep_moved_in_window(scratch);
   test_keep_run_swapped_in_window(scratch);

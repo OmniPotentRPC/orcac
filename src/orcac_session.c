@@ -195,19 +195,41 @@ static int paths_fail(const OrcacSessionDirs *dirs, const char *name) {
 }
 
 /*
+ * Reopen name in the root after a failed removal, making it again if
+ * the removal took it. One made here goes through open_new_dir. One
+ * the removal left may still hold what it could not remove, so it is
+ * kept, without the emptiness check, only while
+ * orcac_check_private_dir accepts it; anything else is left in place
+ * and the result is -1.
+ */
+static int reopen_dir(int root_fd, const char *name) {
+  int fd;
+  if (mkdirat(root_fd, name, 0700) == 0) {
+    return open_new_dir(root_fd, name);
+  }
+  if (errno != EEXIST) {
+    return -1;
+  }
+  fd = openat(root_fd, name, DIR_FLAGS);
+  if (fd >= 0 && orcac_check_private_dir(root_fd, name, fd, 0) != 0) {
+    close(fd);
+    fd = -1;
+  }
+  return fd;
+}
+
+/*
  * Make again whatever part of the layout a failed removal took, and
- * reopen run_fd, guess_fd and keep_fd; one that cannot be made stays
- * -1, which the next reset, guess lookup or keep already handles. errno
- * is kept.
+ * reopen run_fd, guess_fd and keep_fd; one that cannot be made, or
+ * whose entry is not a private directory of this user on the root's
+ * device, stays -1, which the next reset, guess lookup or keep already
+ * handles. errno is kept.
  */
 static void reopen_layout(OrcacSessionDirs *dirs) {
   int saved = errno;
-  (void)mkdirat(dirs->root_fd, "run", 0700);
-  (void)mkdirat(dirs->root_fd, "guess", 0700);
-  (void)mkdirat(dirs->root_fd, "keep", 0700);
-  dirs->run_fd = openat(dirs->root_fd, "run", DIR_FLAGS);
-  dirs->guess_fd = openat(dirs->root_fd, "guess", DIR_FLAGS);
-  dirs->keep_fd = openat(dirs->root_fd, "keep", DIR_FLAGS);
+  dirs->run_fd = reopen_dir(dirs->root_fd, "run");
+  dirs->guess_fd = reopen_dir(dirs->root_fd, "guess");
+  dirs->keep_fd = reopen_dir(dirs->root_fd, "keep");
   errno = saved;
 }
 
