@@ -1529,6 +1529,189 @@ static void test_keep_restore_fails(const char *scratch) {
   CHECK(entry_count(scratch) == before, "scratch not back to its entries");
 }
 
+static char taken_to[PATH_MAX + 32];
+static int steal_calls = 0;
+
+/*
+ * Move keep/failed, whatever the rename put there, out of the session
+ * tree and put an impostor keep/failed holding a file named impostor in
+ * its place.
+ */
+static void steal_failed(int keep_fd) {
+  int fd;
+  ++steal_calls;
+  CHECK(renameat(keep_fd, "failed", AT_FDCWD, taken_to) == 0 &&
+            mkdirat(keep_fd, "failed", 0700) == 0,
+        "swap keep/failed for an impostor");
+  fd = openat(keep_fd, "failed/impostor",
+              O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  CHECK(fd >= 0, "fill the impostor keep/failed");
+  if (fd >= 0) {
+    close(fd);
+  }
+}
+
+static void steal_after_move(int root_fd, int keep_fd) {
+  (void)root_fd;
+  steal_failed(keep_fd);
+}
+
+/* 1 while run_fd is -1 or a run/ without the impostor. */
+static int run_fd_clean(const OrcacSessionDirs *dirs) {
+  struct stat st;
+  return dirs->run_fd < 0 ||
+         fstatat(dirs->run_fd, "impostor", &st, AT_SYMLINK_NOFOLLOW) != 0;
+}
+
+/*
+ * run/ swapped for a decoy before the renameat, and the decoy the
+ * rename put in keep/failed swapped for an impostor right after it:
+ * keep_run moves nothing back, since keep/failed is no longer what the
+ * rename put there, fails with EIO rather than EXDEV, and run_fd is
+ * never opened on the impostor.
+ */
+static void test_keep_failed_stolen(const char *scratch) {
+  OrcacSessionDirs dirs;
+  char err[256];
+  char failed[PATH_MAX + 48];
+  char path[PATH_MAX + 64];
+  int before = entry_count(scratch);
+  int rc;
+  int got;
+
+  CHECK(orcac_session_open(scratch, &dirs, err, sizeof(err)) == 0,
+        "open for a stolen keep/failed");
+  if (dirs.root == NULL) {
+    return;
+  }
+  snprintf(run_race_to, sizeof(run_race_to), "%s/run-out", scratch);
+  snprintf(taken_to, sizeof(taken_to), "%s/taken-out", scratch);
+  snprintf(failed, sizeof(failed), "%s/keep/failed", dirs.root);
+  snprintf(path, sizeof(path), "%s/marker", dirs.run);
+  write_file(path, "marker");
+  run_race_calls = 0;
+  steal_calls = 0;
+  orcac_test_before_keep = swap_run_out;
+  orcac_test_after_move = steal_after_move;
+  errno = 0;
+  rc = orcac_session_keep_run(&dirs);
+  got = errno;
+  orcac_test_before_keep = NULL;
+  orcac_test_after_move = NULL;
+  CHECK(run_race_calls == 1 && steal_calls == 1, "race hooks not called");
+  CHECK(rc != 0 && got == EIO, "stolen keep/failed not refused with EIO");
+  snprintf(path, sizeof(path), "%s/impostor", dirs.run);
+  CHECK(access(path, F_OK) != 0, "impostor moved back as run/");
+  CHECK(access(failed, F_OK) == 0 && entry_count(failed) == 1,
+        "impostor keep/failed touched");
+  CHECK(run_fd_clean(&dirs), "run_fd opened on the impostor");
+  CHECK(file_is(run_race_to, "marker", "marker"),
+        "swapped-out run/ touched");
+  snprintf(path, sizeof(path), "%s/decoy", taken_to);
+  CHECK(access(path, F_OK) == 0, "stolen decoy touched");
+  CHECK(orcac_session_close(&dirs, err, sizeof(err)) == 0,
+        "close after a stolen keep/failed");
+  remove_by_path(scratch, "run-out");
+  remove_by_path(scratch, "taken-out");
+  CHECK(entry_count(scratch) == before, "scratch not back to its entries");
+}
+
+static int restore_calls = 0;
+
+static int restore_exdev(int root_fd, int keep_fd) {
+  (void)root_fd;
+  (void)keep_fd;
+  ++restore_calls;
+  return EXDEV;
+}
+
+static int restore_after_steal(int root_fd, int keep_fd) {
+  (void)root_fd;
+  ++restore_calls;
+  steal_failed(keep_fd);
+  return 0;
+}
+
+/*
+ * The move back, on the path where keep/ left the root after taking the
+ * run and on the path where the rename took a decoy, fails with EIO
+ * when the renameat back fails with EXDEV, and with EIO when what it
+ * moved back is not what the first rename took: an impostor slipped
+ * into keep/failed after the checks lands as run/, and run_fd is not
+ * opened on it.
+ */
+static void test_keep_restore_eio(const char *scratch, int decoy,
+                                  int steal) {
+  OrcacSessionDirs dirs;
+  char err[256];
+  char taken[PATH_MAX + 48];
+  char path[PATH_MAX + 64];
+  int before = entry_count(scratch);
+  int rc;
+  int got;
+
+  CHECK(orcac_session_open(scratch, &dirs, err, sizeof(err)) == 0,
+        "open for a failed move back");
+  if (dirs.root == NULL) {
+    return;
+  }
+  snprintf(keep_race_to, sizeof(keep_race_to), "%s/keep-out", scratch);
+  snprintf(run_race_to, sizeof(run_race_to), "%s/run-out", scratch);
+  snprintf(taken_to, sizeof(taken_to), "%s/taken-out", scratch);
+  if (steal) {
+    snprintf(taken, sizeof(taken), "%s", taken_to);
+  } else if (decoy) {
+    snprintf(taken, sizeof(taken), "%s/keep/failed", dirs.root);
+  } else {
+    snprintf(taken, sizeof(taken), "%s/failed", keep_race_to);
+  }
+  snprintf(path, sizeof(path), "%s/marker", dirs.run);
+  write_file(path, "marker");
+  keep_race_calls = 0;
+  run_race_calls = 0;
+  restore_calls = 0;
+  steal_calls = 0;
+  orcac_test_before_keep = decoy ? swap_run_out : move_keep_out;
+  orcac_test_before_restore = steal ? restore_after_steal : restore_exdev;
+  errno = 0;
+  rc = orcac_session_keep_run(&dirs);
+  got = errno;
+  orcac_test_before_keep = NULL;
+  orcac_test_before_restore = NULL;
+  CHECK(keep_race_calls + run_race_calls == 1 && restore_calls == 1,
+        "move-back hooks not called");
+  CHECK(steal_calls == (steal ? 1 : 0), "impostor hook miscounted");
+  CHECK(rc != 0 && got == EIO, "failed move back not reported as EIO");
+  if (decoy) {
+    CHECK(file_is(run_race_to, "marker", "marker"),
+          "swapped-out run/ touched");
+    snprintf(path, sizeof(path), "%s/decoy", taken);
+  } else {
+    snprintf(path, sizeof(path), "%s/marker", taken);
+  }
+  CHECK(access(path, F_OK) == 0, "taken object not where it was left");
+  if (steal) {
+    snprintf(path, sizeof(path), "%s/impostor", dirs.run);
+    CHECK(access(path, F_OK) == 0, "impostor not moved back as run/");
+    CHECK(dirs.run_fd < 0, "run_fd opened on the impostor");
+  } else {
+    CHECK(dirs.run_fd >= 0 && entry_count(dirs.run) == 0 &&
+              run_fd_clean(&dirs),
+          "run/ not made again empty");
+  }
+  CHECK(orcac_session_close(&dirs, err, sizeof(err)) == 0,
+        "close after a failed move back");
+  if (decoy) {
+    remove_by_path(scratch, "run-out");
+  } else {
+    remove_by_path(scratch, "keep-out");
+  }
+  if (steal) {
+    remove_by_path(scratch, "taken-out");
+  }
+  CHECK(entry_count(scratch) == before, "scratch not back to its entries");
+}
+
 /*
  * With allocation failing for good from the kth path allocation of
  * orcac_session_open on, the new root is still removed: undoing it
@@ -2055,6 +2238,11 @@ int main(int argc, char **argv) {
   test_keep_moved_in_window(scratch);
   test_keep_run_swapped_in_window(scratch);
   test_keep_restore_fails(scratch);
+  test_keep_failed_stolen(scratch);
+  test_keep_restore_eio(scratch, 0, 0);
+  test_keep_restore_eio(scratch, 0, 1);
+  test_keep_restore_eio(scratch, 1, 0);
+  test_keep_restore_eio(scratch, 1, 1);
   test_session_alloc_stuck(scratch);
   test_configure_cleanup_fails(fake_bin, scratch);
   test_configure_rollback_fails(fake_bin, scratch);

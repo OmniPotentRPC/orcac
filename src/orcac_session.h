@@ -69,14 +69,25 @@ int orcac_session_reset_run(OrcacSessionDirs *dirs, char *errbuf,
  * made only while the root's entries run and keep are still run_fd and
  * keep_fd, by device and inode: a keep/ or run/ renamed away, or
  * replaced by a symlink or another directory, is -1 with EXDEV and
- * nothing moves. After the rename keep/failed must be run_fd and the
- * root's keep entry keep_fd. If run/ was swapped between that check and
- * the rename, what the rename took goes back to the root's run entry;
- * if keep/ left the root, the files are moved back to run/ through
- * keep_fd. Either is -1 with EXDEV once the move back is done. When it
- * fails, the result is -1 with its error, never EXDEV, and the files
- * stay wherever keep/ went; when the files moved back are no longer the
- * root's run entry, the result is -1 with EIO.
+ * nothing moves. What the rename put in keep/failed is pinned by type,
+ * device and inode as soon as it returns. The run is kept only when the
+ * pin is run_fd, keep/failed is still the pin and the root's keep entry
+ * is keep_fd. Otherwise, with run/ swapped for a decoy before the
+ * rename or keep/ gone from the root after it, the pinned object is
+ * renamed back to the root's run entry through keep_fd, wherever keep/
+ * now is, and the result is -1 with EXDEV only once that entry is the
+ * pin again: EXDEV means that what the rename took is back as run/,
+ * not that the run's files never left the tree, since a decoy taken
+ * means run/ had already been moved away by someone else. The result is
+ * -1 with EIO, and nothing is renamed back, when keep/failed is no
+ * longer the pin, as when something took it and left another object
+ * there; -1 with EIO when, after the move back, the root's run entry is
+ * not the pin; and -1 with the error of the move back when that fails
+ * (EIO for EXDEV). In those cases the pinned object is wherever it was
+ * left: in keep/failed, in a keep/ that left the root, or taken away.
+ * run_fd stays open only while it is still the root's run entry;
+ * otherwise it is closed and replaced only by a run/ this call made,
+ * else -1, so it is never opened on an entry put there by anyone else.
  */
 int orcac_session_keep_run(OrcacSessionDirs *dirs);
 
@@ -89,10 +100,16 @@ extern void (*orcac_test_after_keep)(int root_fd);
  */
 extern void (*orcac_test_before_keep)(int root_fd, int keep_fd);
 /*
- * Called by orcac_session_keep_run right after its renameat succeeds,
- * before the identity checks that follow it.
+ * Called by orcac_session_keep_run once its renameat has succeeded and
+ * what it moved is pinned, before the identity checks that follow.
  */
 extern void (*orcac_test_after_move)(int root_fd, int keep_fd);
+/*
+ * Called by orcac_session_keep_run after those checks, right before the
+ * renameat that moves the pinned object back to the root's run entry; a
+ * nonzero errno value fails that renameat with it.
+ */
+extern int (*orcac_test_before_restore)(int root_fd, int keep_fd);
 /*
  * Asked by orcac_session_remove and orcac_session_close before they
  * remove anything; a nonzero errno value fails the removal with it and

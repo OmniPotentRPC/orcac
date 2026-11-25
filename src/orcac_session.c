@@ -14,6 +14,7 @@
 void (*orcac_test_after_keep)(int root_fd) = NULL;
 void (*orcac_test_before_keep)(int root_fd, int keep_fd) = NULL;
 void (*orcac_test_after_move)(int root_fd, int keep_fd) = NULL;
+int (*orcac_test_before_restore)(int root_fd, int keep_fd) = NULL;
 int (*orcac_test_remove_fail)(const OrcacSessionDirs *dirs) = NULL;
 int (*orcac_test_paths_fail)(int parent_fd, const char *root_name) = NULL;
 int orcac_test_alloc_fail = 0;
@@ -261,15 +262,27 @@ int orcac_session_reset_run(OrcacSessionDirs *dirs, char *errbuf,
   return 0;
 }
 
+static int same_object(const struct stat *a, const struct stat *b) {
+  return (a->st_mode & S_IFMT) == (b->st_mode & S_IFMT) &&
+         a->st_dev == b->st_dev && a->st_ino == b->st_ino;
+}
+
+/* 1 while name in dirfd is the object pin was taken of. errno is kept. */
+static int entry_is_pin(int dirfd, const char *name, const struct stat *pin) {
+  int saved = errno;
+  struct stat entry;
+  int ok = fstatat(dirfd, name, &entry, AT_SYMLINK_NOFOLLOW) == 0 &&
+           same_object(&entry, pin);
+  errno = saved;
+  return ok;
+}
+
 /* 1 while name in dirfd is the directory open at fd. errno is kept. */
 static int entry_is_fd(int dirfd, const char *name, int fd) {
   int saved = errno;
   struct stat st;
-  struct stat entry;
-  int ok = fd >= 0 && fstat(fd, &st) == 0 &&
-           fstatat(dirfd, name, &entry, AT_SYMLINK_NOFOLLOW) == 0 &&
-           S_ISDIR(entry.st_mode) && st.st_dev == entry.st_dev &&
-           st.st_ino == entry.st_ino;
+  int ok = fd >= 0 && fstat(fd, &st) == 0 && S_ISDIR(st.st_mode) &&
+           entry_is_pin(dirfd, name, &st);
   errno = saved;
   return ok;
 }
@@ -279,21 +292,40 @@ static int keep_pinned(const OrcacSessionDirs *dirs) {
          entry_is_fd(dirs->root_fd, "run", dirs->run_fd);
 }
 
+static int move_back(int root_fd, int keep_fd) {
+#ifdef ORCAC_TEST_HOOKS
+  if (orcac_test_before_restore != NULL) {
+    int injected = orcac_test_before_restore(root_fd, keep_fd);
+    if (injected != 0) {
+      errno = injected;
+      return -1;
+    }
+  }
+#endif
+  return renameat(keep_fd, "failed", root_fd, "run");
+}
+
 /*
  * renameat cannot name an inode, so between the last check and the
  * rename run/ can be swapped, and the rename then takes the decoy, or
- * keep/ can leave the root and take the files with it. Both ends are
- * checked by device and inode after the rename, and anything it should
- * not have moved goes back to the root's run entry through the held
- * keep_fd, wherever keep/ now is. When that move back fails, its error
- * is the result, never EXDEV, which promises that nothing left the
- * root; so is EIO when the files moved back are no longer run/.
+ * keep/ can leave the root and take the files with it. What the rename
+ * put in keep/failed is pinned by type, device and inode as soon as it
+ * returns; the run is kept only when that pin is run_fd, keep/failed
+ * still is the pin and the root's keep entry is keep_fd. Otherwise the
+ * pinned object goes back to the root's run entry through the held
+ * keep_fd, wherever keep/ now is, and EXDEV is returned only once that
+ * entry is the pin again. Anything else is EIO, or the error of the
+ * move back, so EXDEV always means that what the rename took is the
+ * root's run entry again.
  */
 static int move_run_to_keep(OrcacSessionDirs *dirs) {
   int root_fd = dirs->root_fd;
   int keep_fd = dirs->keep_fd;
+  struct stat run_st;
+  struct stat taken;
   int took_run;
   int keep_in_root;
+  int still_taken;
   if (!keep_pinned(dirs)) {
     errno = EXDEV;
     return -1;
@@ -310,7 +342,14 @@ static int move_run_to_keep(OrcacSessionDirs *dirs) {
     orcac_test_before_keep(root_fd, keep_fd);
   }
 #endif
+  if (fstat(dirs->run_fd, &run_st) != 0) {
+    return -1;
+  }
   if (renameat(root_fd, "run", keep_fd, "failed") != 0) {
+    return -1;
+  }
+  if (fstatat(keep_fd, "failed", &taken, AT_SYMLINK_NOFOLLOW) != 0) {
+    errno = EIO;
     return -1;
   }
 #ifdef ORCAC_TEST_HOOKS
@@ -318,18 +357,23 @@ static int move_run_to_keep(OrcacSessionDirs *dirs) {
     orcac_test_after_move(root_fd, keep_fd);
   }
 #endif
-  took_run = entry_is_fd(keep_fd, "failed", dirs->run_fd);
+  took_run = same_object(&taken, &run_st);
+  still_taken = entry_is_pin(keep_fd, "failed", &taken);
   keep_in_root = entry_is_fd(root_fd, "keep", keep_fd);
-  if (took_run && keep_in_root) {
+  if (took_run && still_taken && keep_in_root) {
     return 0;
   }
-  if (renameat(keep_fd, "failed", root_fd, "run") != 0) {
+  if (!still_taken) {
+    errno = EIO;
+    return -1;
+  }
+  if (move_back(root_fd, keep_fd) != 0) {
     if (errno == EXDEV) {
       errno = EIO;
     }
     return -1;
   }
-  if (took_run && !entry_is_fd(root_fd, "run", dirs->run_fd)) {
+  if (!entry_is_pin(root_fd, "run", &taken)) {
     errno = EIO;
     return -1;
   }
@@ -337,17 +381,24 @@ static int move_run_to_keep(OrcacSessionDirs *dirs) {
   return -1;
 }
 
+/*
+ * run_fd is kept only while it is still the root's run entry; otherwise
+ * it is replaced only by a run/ this call made itself, never by
+ * whatever else holds that name.
+ */
 int orcac_session_keep_run(OrcacSessionDirs *dirs) {
   int kept = move_run_to_keep(dirs);
   int saved = errno;
-  close_fd(&dirs->run_fd);
+  if (!entry_is_fd(dirs->root_fd, "run", dirs->run_fd)) {
+    close_fd(&dirs->run_fd);
 #ifdef ORCAC_TEST_HOOKS
-  if (kept == 0 && orcac_test_after_keep != NULL) {
-    orcac_test_after_keep(dirs->root_fd);
-  }
+    if (kept == 0 && orcac_test_after_keep != NULL) {
+      orcac_test_after_keep(dirs->root_fd);
+    }
 #endif
-  if (mkdirat(dirs->root_fd, "run", 0700) == 0 || errno == EEXIST) {
-    dirs->run_fd = openat(dirs->root_fd, "run", DIR_FLAGS);
+    if (mkdirat(dirs->root_fd, "run", 0700) == 0) {
+      dirs->run_fd = openat(dirs->root_fd, "run", DIR_FLAGS);
+    }
   }
   errno = saved;
   return kept;
