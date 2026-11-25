@@ -133,7 +133,9 @@ meson test -C build
 Needs a C11 compiler, meson, ninja and `capnp` (the Cap'n Proto compiler;
 the C runtime and code generator are vendored). With Pixi: `pixi run test`.
 No ORCA is needed to build or to run the suite; `live_orca` is the one test
-that runs ORCA and it is reported as skipped without one.
+that runs ORCA and it is reported as skipped without one. The comma-decimal
+locale checks skip when no `de_DE` or `fr_FR` locale is installed;
+`ORCAC_REQUIRE_COMMA_LOCALE=1` makes that a failure instead.
 
 Install header, library and `orcac.pc` (`soversion` 1):
 

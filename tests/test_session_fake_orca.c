@@ -275,6 +275,30 @@ static void test_echoed_comment(void) {
   orcac_session_destroy(s);
 }
 
+/* A host that set a comma-decimal LC_NUMERIC gets the same deck and the same
+ * numbers back through a whole session step. */
+static void test_comma_locale_session(void) {
+  clear_knobs();
+  const char *comma = test_comma_locale();
+  if (!comma)
+    return;
+  printf("session step under %s\n", comma);
+  OrcaCSession *s = make_session(hf());
+  CHECK(s != NULL);
+  if (s) {
+    double g[9];
+    OrcaCResult r = orcac_session_energy_gradient(s, 3, k_water, k_water_z, g);
+    CHECK(r.ok == 1);
+    CHECK_NEAR(r.energy_h, -76.326775405024, 1e-12);
+    for (int k = 0; k < 9; ++k)
+      CHECK_NEAR(g[k], k_want_grad[k], 1e-15);
+    CHECK(log_count("0.1173000000") == 1);
+    CHECK(log_count("0,1173") == 0);
+    orcac_session_destroy(s);
+  }
+  setlocale(LC_NUMERIC, "C");
+}
+
 static void test_timeout(void) {
   clear_knobs();
   struct ORCAParams p = hf();
@@ -462,6 +486,7 @@ int main(int argc, char **argv) {
   test_moread_failure_retries();
   test_failures();
   test_echoed_comment();
+  test_comma_locale_session();
   test_timeout();
   test_executable_resolution();
   test_keep_files_and_params();
