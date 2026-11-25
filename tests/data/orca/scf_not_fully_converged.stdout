@@ -1,0 +1,39 @@
+Synthetic orcac test fixture. Hand-written; not output of an ORCA run.
+                                 *****************
+                                 * O   R   C   A *
+                                 *****************
+
+================================================================================
+                                       INPUT FILE
+================================================================================
+NAME = orcac.inp
+|  1> ! HF STO-3G TightSCF EnGrad
+|  2> %scf ConvForced true end
+|  3> * xyz 0 1
+|  4> O 0.0 0.0 0.1173
+|  5> H 0.0 0.7572 -0.4692
+|  6> H 0.0 -0.7572 -0.4692
+|  7> *
+|  8>
+|  9>                          ****END OF INPUT****
+================================================================================
+
+--------------
+SCF ITERATIONS
+--------------
+ITER       Energy         Delta-E        Max-DP      RMS-DP      [F,P]     Damp
+  0    -75.9000000000   0.000000e+00  1.00e-01  1.00e-02  1.00e-01  0.700
+  1    -75.4000000000   5.000000e-01  9.00e-02  9.00e-03  9.00e-02  0.700
+
+  Warning: the SCF is not fully converged after the maximum iterations
+
+----------------
+TOTAL SCF ENERGY
+----------------
+
+Total Energy       :          -75.40000000000000 Eh
+
+-------------------------   --------------------
+FINAL SINGLE POINT ENERGY       -75.400000000000
+-------------------------   --------------------
+ORCA TERMINATED NORMALLY

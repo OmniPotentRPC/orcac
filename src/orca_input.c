@@ -1,11 +1,20 @@
 #include "orca_input.h"
+#include "orcac_clocale.h"
 #include "orcac_errbuf.h"
 
-#include <ctype.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* isdigit and isalnum without the locale. */
+static int ascii_digit(unsigned char c) {
+  return c >= '0' && c <= '9';
+}
+
+static int ascii_alnum(unsigned char c) {
+  return ascii_digit(c) || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
 
 static const char *kSymbols[] = {
     NULL, "H", "He", "Li", "Be", "B", "C", "N", "O", "F", "Ne", "Na",
@@ -91,7 +100,7 @@ static int owned_token(const char *what, const char *start, size_t n,
   }
   if (n > 3 && equal_nocase_n(start, 3, "pal")) {
     size_t i = 3;
-    while (i < n && isdigit((unsigned char)start[i])) {
+    while (i < n && ascii_digit((unsigned char)start[i])) {
       ++i;
     }
     if (i == n) {
@@ -157,7 +166,7 @@ int orcac_validate_token(const char *what, const char *text, char *errbuf,
   }
   for (const char *p = text; *p != '\0'; ++p) {
     unsigned char c = (unsigned char)*p;
-    if (!isalnum(c) && strchr("-+*(),/_.'", (int)c) == NULL) {
+    if (!ascii_alnum(c) && strchr("-+*(),/_.'", (int)c) == NULL) {
       if (c == '\n' || c == '\r') {
         orcac_errf(errbuf, errbuf_n, "orcac: %s must be a single line", what);
       } else if (c < 0x20 || c == 0x7f) {
@@ -235,7 +244,7 @@ int orcac_validate_blocks(const char *blocks, char *errbuf, size_t errbuf_n) {
       while (*name == ' ' || *name == '\t') {
         ++name;
       }
-      while (isalnum((unsigned char)name[n]) || name[n] == '_') {
+      while (ascii_alnum((unsigned char)name[n]) || name[n] == '_') {
         ++n;
       }
       for (size_t i = 0; i < sizeof(owned) / sizeof(owned[0]); ++i) {
@@ -300,6 +309,7 @@ int orcac_render_input(const OrcacDeck *deck, int n_atoms,
                        size_t errbuf_n) {
   int i;
   int moread;
+  OrcacCNumeric c_numeric;
   TextBuf b = {NULL, 0u, 0u, 0};
 
   if (input_text == NULL || deck == NULL || positions_ang == NULL ||
@@ -355,12 +365,19 @@ int orcac_render_input(const OrcacDeck *deck, int n_atoms,
 
   buf_appendf(&b, "* xyz %d %d\n", deck->charge,
               deck->multiplicity > 0 ? deck->multiplicity : 1);
+  if (orcac_c_numeric_enter(&c_numeric) != 0) {
+    free(b.data);
+    orcac_errf(errbuf, errbuf_n,
+               "orcac: could not switch to the C numeric locale");
+    return -1;
+  }
   for (i = 0; i < n_atoms; ++i) {
     buf_appendf(&b, "%s  %.10f %.10f %.10f\n",
                 orcac_element_symbol(atomic_numbers[i]),
                 positions_ang[3 * i], positions_ang[3 * i + 1],
                 positions_ang[3 * i + 2]);
   }
+  orcac_c_numeric_leave(&c_numeric);
   buf_appendf(&b, "*\n");
 
   if (b.failed) {

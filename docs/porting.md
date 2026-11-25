@@ -11,11 +11,16 @@ The pieces map as follows:
   blocks, optional `%maxcore`, `%pal nprocs` and `%moinp` with `MORead`, an
   always-present `%scf ConvForced true end`, then an `xyz` block in
   Angstrom.
-- Execution: a per-instance scratch directory, the ORCA process in its own
-  process group, stdout and stderr captured to files, and a wall-clock
-  timeout that escalates from SIGTERM to SIGKILL.
+- Execution: a private session directory with a fresh `run/` per attempt,
+  the ORCA process in its own process group with no inherited
+  descriptors, stdout and stderr captured to files, a timeout or cancel
+  that escalates from SIGTERM to SIGKILL after 2 s, and a SIGKILL to the
+  group once ORCA has exited.
 - Parsing: the `.engrad` atom count, energy in Eh, gradient in Eh/bohr and
-  atomic numbers, checked against the input.
+  atomic numbers, read as whole tokens and checked against the input,
+  after the output has been checked for an unconverged SCF.
+
+[runner.md](runner.md) has the details.
 
 An rgpot frontend fills `OrcaCConfig` from its potential options after
 `orcac_config_init`. orcac returns the gradient in Hartree/Bohr, the units

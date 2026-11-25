@@ -3,6 +3,7 @@
 #include <orcac.h>
 
 #include "orcac_cache.h"
+#include "orcac_session.h"
 
 #include <pthread.h>
 #include <stdatomic.h>
@@ -41,11 +42,18 @@ typedef struct OrcacSettings {
 struct OrcaCSession {
   OrcacSettings settings;
   char *exe;     /* realpath resolved at create or configure */
-  char *run_dir;
+  OrcacSessionDirs dirs;
+  /*
+   * A new tree that a failed orcac_configure could not remove again;
+   * the next scratch_dir change and orcac_destroy retry it.
+   */
+  OrcacSessionDirs leftover;
   pid_t owner_pid;
   pthread_mutex_t lock;
   atomic_uint cancel_gen;   /* orcac_cancel bumps it */
   unsigned int cancel_seen; /* value when the running call entered */
   OrcacGuessCache guesses;
+  int run_not_emptied; /* run/ kept files after the last success */
+  char run_cleanup_error[512];
   char last_error[ORCAC_LAST_ERROR_SIZE];
 };

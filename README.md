@@ -101,7 +101,7 @@ into `reserved` or by appending fields. A NULL config selects the defaults.
 | `keywords` | extra simple-input words, a single line | none |
 | `blocks` | user `%` blocks, validated | none |
 | `executable` | ORCA path or `PATH` name | `$ORCAC_ORCA`, then `orca` on `PATH` |
-| `scratch_dir` | parent of the session run directory | `$TMPDIR`, then `/tmp` |
+| `scratch_dir` | parent of the private session directory | `$TMPDIR`, then `/tmp` |
 | `charge` | net charge | 0 |
 | `multiplicity` | spin multiplicity 2S+1, at least 1 | 1 |
 | `nprocs` | `%pal nprocs`, omitted when 1 | 1 |
@@ -179,6 +179,12 @@ not for calls that enter later. The ORCA process group then gets SIGTERM,
 and SIGKILL if it has not exited within 2 s, and the call returns
 `ORCAC_E_CANCELLED`. Timeouts escalate the same way.
 
+Each session owns a 0700 directory with `run/`, emptied before every ORCA
+attempt, `guess/` for the MORead slots and `keep/failed` for the most
+recent failed run, whose path the error text names. Removal never follows
+symlinks. [docs/runner.md](docs/runner.md) describes the process and file
+handling and what has not been checked against a real ORCA.
+
 ORCA runs in its own process group with stdin on `/dev/null`, its stdout and
 stderr in the run directory, and no other descriptor, even when the caller
 left descriptors without close-on-exec or has 0, 1 or 2 closed. orcac waits
@@ -206,11 +212,19 @@ meson test -C build --print-errorlogs
 python3 scripts/build_docs.py
 ```
 
+CI also runs the suite under ASan and UBSan with gcc and clang:
+
+```sh
+meson setup build-san -Db_sanitize=address,undefined -Db_lundef=false
+meson test -C build-san --print-errorlogs
+```
+
 The tests use a fake `orca` script and synthetic fixtures under
 `tests/data/orca`. They are hand-written in ORCA's output layout and were
 not produced by an ORCA run. No test needs ORCA. The optional
-`optional-orca` suite runs a real H2 single point when `ORCAC_ORCA` names a
-licensed local ORCA install, and skips otherwise. ORCA's EULA does not allow
+`optional-orca` suite runs a real H2 single point and a MORead-chained
+repeat, which must agree to 1 cm^-1, when `ORCAC_ORCA` names a licensed
+local ORCA install, and skips otherwise. ORCA's EULA does not allow
 installing it on shared CI runners, so CI only runs that lane when the
 `ORCAC_ORCA` repository variable points at an existing install.
 

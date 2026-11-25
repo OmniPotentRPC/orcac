@@ -24,6 +24,7 @@ endif
 liborcac_sources = files(
   'src/orcac.c',
   'src/orcac_cache.c',
+  'src/orcac_session.c',
   'src/orca_input.c',
   'src/orca_parse.c',
   'src/orca_runner.c',
@@ -95,6 +96,14 @@ if get_option('with_tests')
        args: [meson.current_source_dir()],
        timeout: 60)
 
+  test_parse = executable(
+    'test_orca_parse',
+    ['tests/test_orca_parse.c', 'src/orca_parse.c'],
+    include_directories: [inc, include_directories('src')],
+    c_args: common_c_args,
+  )
+  test('orca_parse', test_parse, args: [meson.current_source_dir()])
+
   test_real_optional = executable(
     'test_orca_real_optional',
     'tests/test_orca_real_optional.c',
@@ -104,6 +113,25 @@ if get_option('with_tests')
     c_args: common_c_args,
   )
   test('orca_real_optional', test_real_optional, suite: ['optional-orca'])
+
+  test(
+    'comma-locale',
+    python,
+    args: [
+      meson.current_source_dir() / 'tests/run_comma_locale.py',
+      '--source-dir',
+      meson.current_source_dir(),
+      test_stub,
+      test_replay,
+      test_abi,
+      test_internal,
+      test_parse,
+      test_real_optional,
+    ],
+    is_parallel: false,
+    timeout: 300,
+    suite: ['locale'],
+  )
 
   test(
     'readme-abi-surface',

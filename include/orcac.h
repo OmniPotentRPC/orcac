@@ -192,7 +192,14 @@ ORCAC_API int orcac_create(const OrcaCConfig *config, OrcaCSession **out,
  * orcac_create. On failure the session keeps its previous options. A
  * change of charge or multiplicity, or a switch to ORCAC_GUESS_FRESH,
  * drops every stored guess; a new scratch_dir moves the session to a new
- * run directory and removes the old one. Stored guesses are keyed on
+ * run directory and removes the old one. When the old one cannot be
+ * removed, the call is ORCAC_E_ERROR, the new one is removed again and
+ * the session stays in the old one with its previous options, though
+ * its stored guesses are dropped. If the new one cannot be removed
+ * either, the error says so too and the session keeps hold of it: the
+ * next call with a new scratch_dir removes it first, and is
+ * ORCAC_E_ERROR without changing anything while it still cannot, and
+ * orcac_destroy removes it with the rest. Stored guesses are keyed on
  * method, basis, keywords, blocks, the resolved executable, charge,
  * multiplicity and the atomic numbers, so a guess is only read back
  * under the settings that produced it.
@@ -246,9 +253,12 @@ ORCAC_API int orcac_cancel(OrcaCSession *session);
 ORCAC_API const char *orcac_last_error(const OrcaCSession *session);
 
 /**
- * Remove the run directory and free session. NULL is a no-op. In a
- * forked child only the memory is freed; the run directory belongs to
- * the creating process. Must not race with another call on session.
+ * Remove the run directory, and any one a failed orcac_configure could
+ * not remove, and free session. NULL is a no-op. In a forked child only
+ * the memory is freed; the run directory belongs to the creating
+ * process. Must not race with another call on session. Afterwards
+ * orcac_last_error(NULL) is "" when every directory was removed, else
+ * it names what was left behind.
  */
 ORCAC_API void orcac_destroy(OrcaCSession *session);
 

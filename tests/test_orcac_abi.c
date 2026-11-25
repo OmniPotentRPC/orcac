@@ -22,6 +22,7 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include "test_locale.h"
 
 static int failures = 0;
 
@@ -930,8 +931,81 @@ static void test_malformed_output(void) {
   setenv("ORCAC_FAKE_STDOUT", "truncated.stdout", 1);
   expect_eval(s, ORCAC_E_ERROR, "output without termination banner",
               "normal termination");
+  setenv("ORCAC_FAKE_STDOUT", "term_echo_comment.stdout", 1);
+  expect_eval(s, ORCAC_E_ERROR, "termination banner only in the input echo",
+              "normal termination");
   unsetenv("ORCAC_FAKE_STDOUT");
   expect_eval(s, ORCAC_OK, "well-formed output after malformed runs", NULL);
+  orcac_destroy(s);
+}
+
+/*
+ * Output files ORCA leaves as symlinks are not followed: a .gbw link to
+ * a file outside the session is never stored as a guess, and an .engrad
+ * link, even to a valid file, is not read.
+ */
+static void test_output_symlinks(void) {
+  OrcaCConfig cfg = base_config();
+  OrcaCSession *s;
+  OrcaCResult meta;
+  char *secret = join(work, "secret.gbw");
+  char *engrad = join(getenv("ORCAC_FAKE_REPLAY"), "replay.engrad");
+  double e = 0.0;
+  double g[9];
+  FILE *fp = fopen(secret, "wb");
+  CHECK(fp != NULL, "write secret.gbw");
+  if (fp != NULL) {
+    fputs("secret", fp);
+    fclose(fp);
+  }
+  cfg.guess_policy = ORCAC_GUESS_CHAIN;
+  s = make(&cfg);
+  CHECK(s != NULL, "create for output symlinks");
+  if (s != NULL) {
+    setenv("ORCAC_FAKE_GBW_LINK", secret, 1);
+    CHECK(replay_ok(eval(s, &e, g, &meta), &e, g), "run with a .gbw symlink");
+    unsetenv("ORCAC_FAKE_GBW_LINK");
+    CHECK(replay_ok(eval(s, &e, g, &meta), &e, g) && meta.used_guess == 0,
+          "guess stored through a .gbw symlink");
+    CHECK(replay_ok(eval(s, &e, g, &meta), &e, g) && meta.used_guess == 1,
+          "guess from a regular .gbw not used");
+    setenv("ORCAC_FAKE_ENGRAD_LINK", engrad, 1);
+    expect_eval(s, ORCAC_E_ERROR, "engrad left as a symlink", "orcac.engrad");
+    unsetenv("ORCAC_FAKE_ENGRAD_LINK");
+    orcac_destroy(s);
+  }
+  {
+    char *text = slurp(secret);
+    CHECK(text != NULL && strcmp(text, "secret") == 0,
+          "symlink target changed");
+    free(text);
+  }
+  unlink(secret);
+  free(secret);
+  free(engrad);
+}
+
+/*
+ * A deck comment in blocks holding the banner is echoed by ORCA; with no
+ * real banner after the echo the exit-0 run must still fail.
+ */
+static void test_banner_in_blocks(void) {
+  OrcaCConfig cfg = base_config();
+  OrcaCSession *s;
+  cfg.blocks = "# ORCA TERMINATED NORMALLY\n%scf MaxIter 100 end";
+  s = make(&cfg);
+  CHECK(s != NULL, "create with a banner comment in blocks");
+  if (s == NULL) {
+    return;
+  }
+  setenv("ORCAC_FAKE_ECHO_INPUT", "1", 1);
+  expect_eval(s, ORCAC_OK, "echoed banner comment with the real banner",
+              NULL);
+  setenv("ORCAC_FAKE_STDOUT", "truncated.stdout", 1);
+  expect_eval(s, ORCAC_E_ERROR, "banner only in the echoed blocks comment",
+              "lacks the normal termination banner");
+  unsetenv("ORCAC_FAKE_STDOUT");
+  unsetenv("ORCAC_FAKE_ECHO_INPUT");
   orcac_destroy(s);
 }
 
@@ -1098,6 +1172,23 @@ static void test_reaped_elsewhere(void) {
     }
     unsetenv("ORCAC_FAKE_SLEEP");
     orcac_destroy(s);
+    cfg.timeout_s = 0.0;
+    cfg.blocks = "# ORCA TERMINATED NORMALLY\n%scf MaxIter 100 end";
+    if (orcac_create(&cfg, &s, NULL, 0) != ORCAC_OK) {
+      _exit(65);
+    }
+    setenv("ORCAC_FAKE_ECHO_INPUT", "1", 1);
+    setenv("ORCAC_FAKE_STDOUT", "truncated.stdout", 1);
+    if (eval(s, &e, g, &meta) != ORCAC_E_ERROR ||
+        strstr(orcac_last_error(s), "reaped by another waiter") == NULL) {
+      bad |= 16;
+    }
+    unsetenv("ORCAC_FAKE_STDOUT");
+    if (!replay_ok(eval(s, &e, g, &meta), &e, g)) {
+      bad |= 32;
+    }
+    unsetenv("ORCAC_FAKE_ECHO_INPUT");
+    orcac_destroy(s);
     _exit(bad);
   }
   CHECK(pid > 0, "fork");
@@ -1263,6 +1354,7 @@ int main(int argc, char **argv) {
   const char *root_dir;
   char *replay;
 
+  orcac_test_apply_locale();
   if (getcwd(cwd, sizeof(cwd)) == NULL) {
     fprintf(stderr, "FAIL: getcwd\n");
     return 1;
@@ -1291,6 +1383,9 @@ int main(int argc, char **argv) {
   unsetenv("ORCAC_FAKE_ENGRAD");
   unsetenv("ORCAC_FAKE_STDOUT");
   unsetenv("ORCAC_FAKE_FD_LOG");
+  unsetenv("ORCAC_FAKE_ECHO_INPUT");
+  unsetenv("ORCAC_FAKE_GBW_LINK");
+  unsetenv("ORCAC_FAKE_ENGRAD_LINK");
 
   test_config_header();
   test_additive_layouts();
@@ -1303,6 +1398,8 @@ int main(int argc, char **argv) {
   test_guess_invalidation();
   test_guess_key();
   test_malformed_output();
+  test_banner_in_blocks();
+  test_output_symlinks();
   test_fd_hygiene();
   test_reaped_elsewhere();
   test_mpi_env();

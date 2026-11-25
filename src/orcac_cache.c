@@ -1,22 +1,13 @@
 #include "orcac_cache.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
-
-static char *slot_path(const char *run_dir, const char *name) {
-  size_t na = strlen(run_dir);
-  size_t nb = strlen(name);
-  char *out = (char *)malloc(na + nb + 2u);
-  if (out == NULL) {
-    return NULL;
-  }
-  memcpy(out, run_dir, na);
-  out[na] = '/';
-  memcpy(out + na + 1u, name, nb + 1u);
-  return out;
-}
 
 static int same_entry(const OrcacGuessSlot *slot, const char *key,
                       int n_atoms, const int *atomic_numbers) {
@@ -34,45 +25,77 @@ static void reset_slot(OrcacGuessSlot *slot) {
   memset(slot, 0, sizeof(*slot));
 }
 
-static void remove_slot_file(const char *run_dir, int slot) {
+static void remove_slot_file(int guess_fd, int slot) {
   char name[ORCAC_GUESS_NAME_SIZE];
-  char *path;
-  if (run_dir == NULL) {
+  if (guess_fd < 0) {
     return;
   }
   orcac_cache_slot_name(slot, name);
-  path = slot_path(run_dir, name);
-  if (path != NULL) {
-    unlink(path);
-    free(path);
-  }
+  unlinkat(guess_fd, name, 0);
 }
 
-static int copy_file(const char *from, const char *to) {
-  FILE *in = fopen(from, "rb");
-  FILE *out;
+static int is_regular_at(int dirfd, const char *name) {
+  struct stat st;
+  return fstatat(dirfd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 &&
+         S_ISREG(st.st_mode);
+}
+
+/*
+ * Copy the regular file from_name in from_fd to to_name in to_fd, which
+ * must not exist yet. Neither name is followed if it is a symlink.
+ */
+static int copy_file_at(int from_fd, const char *from_name, int to_fd,
+                        const char *to_name) {
   char buf[8192];
-  size_t got;
+  struct stat st;
+  int in;
+  int out;
   int rc = 0;
-  if (in == NULL) {
+  in = openat(from_fd, from_name,
+              O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+  if (in < 0) {
     return -1;
   }
-  out = fopen(to, "wb");
-  if (out == NULL) {
-    fclose(in);
+  if (fstat(in, &st) != 0 || !S_ISREG(st.st_mode)) {
+    close(in);
     return -1;
   }
-  while ((got = fread(buf, 1u, sizeof(buf), in)) > 0) {
-    if (fwrite(buf, 1u, got, out) != got) {
+  out = openat(to_fd, to_name,
+               O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+  if (out < 0) {
+    close(in);
+    return -1;
+  }
+  for (;;) {
+    ssize_t got = read(in, buf, sizeof(buf));
+    size_t done = 0;
+    if (got < 0 && errno == EINTR) {
+      continue;
+    }
+    if (got < 0) {
       rc = -1;
       break;
     }
+    if (got == 0) {
+      break;
+    }
+    while (done < (size_t)got) {
+      ssize_t put = write(out, buf + done, (size_t)got - done);
+      if (put < 0 && errno == EINTR) {
+        continue;
+      }
+      if (put <= 0) {
+        rc = -1;
+        break;
+      }
+      done += (size_t)put;
+    }
+    if (rc != 0) {
+      break;
+    }
   }
-  if (ferror(in)) {
-    rc = -1;
-  }
-  fclose(in);
-  if (fclose(out) != 0) {
+  close(in);
+  if (close(out) != 0) {
     rc = -1;
   }
   return rc;
@@ -86,43 +109,33 @@ void orcac_cache_slot_name(int slot, char name[ORCAC_GUESS_NAME_SIZE]) {
   snprintf(name, ORCAC_GUESS_NAME_SIZE, "orcac_guess%d.gbw", slot);
 }
 
-int orcac_cache_lookup(const OrcacGuessCache *cache, const char *run_dir,
+int orcac_cache_lookup(const OrcacGuessCache *cache, int guess_fd,
                        const char *key, int n_atoms,
                        const int *atomic_numbers) {
-  if (cache == NULL || run_dir == NULL || n_atoms <= 0 ||
+  if (cache == NULL || guess_fd < 0 || n_atoms <= 0 ||
       atomic_numbers == NULL) {
     return -1;
   }
   for (int i = 0; i < ORCAC_GUESS_SLOTS; ++i) {
     if (same_entry(&cache->slots[i], key, n_atoms, atomic_numbers)) {
       char name[ORCAC_GUESS_NAME_SIZE];
-      char *path;
-      int readable;
       orcac_cache_slot_name(i, name);
-      path = slot_path(run_dir, name);
-      if (path == NULL) {
-        return -1;
-      }
-      readable = access(path, R_OK) == 0;
-      free(path);
-      return readable ? i : -1;
+      return is_regular_at(guess_fd, name) ? i : -1;
     }
   }
   return -1;
 }
 
-int orcac_cache_store(OrcacGuessCache *cache, const char *run_dir,
-                      const char *gbw_path, const char *key, int n_atoms,
+int orcac_cache_store(OrcacGuessCache *cache, int guess_fd, int src_fd,
+                      const char *src_name, const char *key, int n_atoms,
                       const int *atomic_numbers) {
   int target = -1;
   char name[ORCAC_GUESS_NAME_SIZE];
-  char *path;
-  char *tmp;
-  size_t n;
+  char tmp[ORCAC_GUESS_NAME_SIZE + 8];
   int *copy;
   char *key_copy;
 
-  if (cache == NULL || run_dir == NULL || gbw_path == NULL || n_atoms <= 0 ||
+  if (cache == NULL || guess_fd < 0 || src_name == NULL || n_atoms <= 0 ||
       atomic_numbers == NULL) {
     return -1;
   }
@@ -151,27 +164,14 @@ int orcac_cache_store(OrcacGuessCache *cache, const char *run_dir,
 
   reset_slot(&cache->slots[target]);
   orcac_cache_slot_name(target, name);
-  path = slot_path(run_dir, name);
-  if (path == NULL) {
+  snprintf(tmp, sizeof(tmp), "%s.tmp", name);
+  unlinkat(guess_fd, tmp, 0);
+  if (copy_file_at(src_fd, src_name, guess_fd, tmp) != 0 ||
+      renameat(guess_fd, tmp, guess_fd, name) != 0) {
+    unlinkat(guess_fd, tmp, 0);
+    unlinkat(guess_fd, name, 0);
     return -1;
   }
-  n = strlen(path);
-  tmp = (char *)malloc(n + 5u);
-  if (tmp == NULL) {
-    free(path);
-    return -1;
-  }
-  memcpy(tmp, path, n);
-  memcpy(tmp + n, ".tmp", 5u);
-  if (copy_file(gbw_path, tmp) != 0 || rename(tmp, path) != 0) {
-    unlink(tmp);
-    unlink(path);
-    free(tmp);
-    free(path);
-    return -1;
-  }
-  free(tmp);
-  free(path);
 
   if (key == NULL) {
     key = "";
@@ -181,7 +181,7 @@ int orcac_cache_store(OrcacGuessCache *cache, const char *run_dir,
   if (copy == NULL || key_copy == NULL) {
     free(copy);
     free(key_copy);
-    remove_slot_file(run_dir, target);
+    remove_slot_file(guess_fd, target);
     return -1;
   }
   memcpy(copy, atomic_numbers, (size_t)n_atoms * sizeof(int));
@@ -194,20 +194,29 @@ int orcac_cache_store(OrcacGuessCache *cache, const char *run_dir,
   return target;
 }
 
-void orcac_cache_drop(OrcacGuessCache *cache, const char *run_dir, int slot) {
+int orcac_cache_copy_out(int guess_fd, int slot, int dest_fd) {
+  char name[ORCAC_GUESS_NAME_SIZE];
+  if (guess_fd < 0 || dest_fd < 0 || slot < 0 || slot >= ORCAC_GUESS_SLOTS) {
+    return -1;
+  }
+  orcac_cache_slot_name(slot, name);
+  return copy_file_at(guess_fd, name, dest_fd, name);
+}
+
+void orcac_cache_drop(OrcacGuessCache *cache, int guess_fd, int slot) {
   if (cache == NULL || slot < 0 || slot >= ORCAC_GUESS_SLOTS) {
     return;
   }
   reset_slot(&cache->slots[slot]);
-  remove_slot_file(run_dir, slot);
+  remove_slot_file(guess_fd, slot);
 }
 
-void orcac_cache_clear(OrcacGuessCache *cache, const char *run_dir) {
+void orcac_cache_clear(OrcacGuessCache *cache, int guess_fd) {
   if (cache == NULL) {
     return;
   }
   for (int i = 0; i < ORCAC_GUESS_SLOTS; ++i) {
-    orcac_cache_drop(cache, run_dir, i);
+    orcac_cache_drop(cache, guess_fd, i);
   }
 }
 

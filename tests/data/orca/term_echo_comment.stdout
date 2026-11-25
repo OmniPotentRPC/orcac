@@ -1,0 +1,39 @@
+Synthetic orcac test fixture. Hand-written; not output of an ORCA run.
+                                 *****************
+                                 * O   R   C   A *
+                                 *****************
+
+================================================================================
+                                       INPUT FILE
+================================================================================
+NAME = orcac.inp
+|  1> # ****ORCA TERMINATED NORMALLY****
+|  2> ! HF STO-3G EnGrad
+|  3> * xyz 0 1
+|  4> O 0.0 0.0 0.1173
+|  5> H 0.0 0.7572 -0.4692
+|  6> H 0.0 -0.7572 -0.4692
+|  7> *
+ORCA TERMINATED NORMALLY
+|  8>
+|  9>                          ****END OF INPUT****
+================================================================================
+
+--------------
+SCF ITERATIONS
+--------------
+ITER       Energy         Delta-E        Max-DP      RMS-DP      [F,P]     Damp
+  0    -75.4000000000   0.000000e+00  1.00e-02  1.00e-03  1.00e-02  0.700
+  1    -75.5000000000  -1.000000e-01  1.00e-05  1.00e-06  1.00e-05  0.700
+
+               *****************************************************
+               *                     SUCCESS                       *
+               *           SCF CONVERGED AFTER   2 CYCLES          *
+               *****************************************************
+
+----------------
+TOTAL SCF ENERGY
+----------------
+
+Total Energy       :          -75.50000000000000 Eh
+Note: ORCA TERMINATED NORMALLY is printed below once the run ends.

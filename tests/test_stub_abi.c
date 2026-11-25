@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include "test_locale.h"
 
 static int fail(const char *msg) {
   fprintf(stderr, "FAIL: %s\n", msg);
@@ -17,6 +18,7 @@ int main(void) {
   int st;
   double e = 0.0;
 
+  orcac_test_apply_locale();
   if (orcac_c_abi_version() != RGPOT_ORCAC_C_ABI_VERSION) {
     return fail("C ABI version mismatch");
   }

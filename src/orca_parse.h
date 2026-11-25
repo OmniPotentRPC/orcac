@@ -17,8 +17,18 @@ int orcac_parse_engrad(const char *text,
 
 void orcac_free_engrad(OrcacEngrad *parsed);
 
+/*
+ * Read the regular file name, relative to the directory open at dirfd,
+ * into a NUL-terminated buffer the caller frees. A final symlink, a FIFO
+ * or anything else that is not a regular file is -1.
+ */
+int orcac_read_file_at(int dirfd, const char *name, char **text_out);
+
+/* orcac_read_file_at relative to the current directory. */
 int orcac_read_file(const char *path, char **text_out);
-char *orcac_file_tail(const char *path, size_t max_bytes);
+
+/* The last max_bytes of name, opened as orcac_read_file_at does. */
+char *orcac_file_tail_at(int dirfd, const char *name, size_t max_bytes);
 
 /*
  * 1 when ORCA output text reports an SCF that stopped unconverged, the
@@ -26,5 +36,8 @@ char *orcac_file_tail(const char *path, size_t max_bytes);
  */
 int orcac_scf_not_converged(const char *text);
 
-/* 1 when ORCA output text carries its normal-termination banner. */
+/*
+ * 1 when ORCA output text carries its normal-termination banner as a
+ * line of its own after the input echo has ended.
+ */
 int orcac_terminated_normally(const char *text);
