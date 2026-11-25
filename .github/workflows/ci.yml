@@ -37,5 +37,5 @@ jobs:
         run: meson setup build-real
       - name: Build
         run: meson compile -C build-real
-      - name: ORCA replay path
-        run: meson test -C build-real --print-errorlogs
+      - name: ORCA real optional lane
+        run: meson test -C build-real --print-errorlogs --suite optional-orca

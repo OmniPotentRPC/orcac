@@ -68,6 +68,16 @@ if get_option('with_tests')
   test('replay_orca_output', test_replay,
        args: [meson.current_source_dir()])
 
+  test_real_optional = executable(
+    'test_orca_real_optional',
+    'tests/test_orca_real_optional.c',
+    include_directories: inc,
+    link_with: liborcac,
+    dependencies: [math_dep],
+    c_args: common_c_args,
+  )
+  test('orca_real_optional', test_real_optional, suite: ['optional-orca'])
+
   test(
     'readme-abi-surface',
     python,
