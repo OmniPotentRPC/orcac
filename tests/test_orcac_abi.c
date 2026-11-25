@@ -930,6 +930,9 @@ static void test_malformed_output(void) {
   setenv("ORCAC_FAKE_STDOUT", "truncated.stdout", 1);
   expect_eval(s, ORCAC_E_ERROR, "output without termination banner",
               "normal termination");
+  setenv("ORCAC_FAKE_STDOUT", "term_echo_comment.stdout", 1);
+  expect_eval(s, ORCAC_E_ERROR, "termination banner only in the input echo",
+              "normal termination");
   unsetenv("ORCAC_FAKE_STDOUT");
   expect_eval(s, ORCAC_OK, "well-formed output after malformed runs", NULL);
   orcac_destroy(s);

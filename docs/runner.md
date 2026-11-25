@@ -109,6 +109,12 @@ line counts when it holds, in any case, one of these banners:
 `SCF ITERATIONS` and the `TOTAL SCF ENERGY` block, so a geometry
 optimisation's message does not. Case folding is ASCII only.
 
+A run that exits 0 must also print `****ORCA TERMINATED NORMALLY****`
+(any number of asterisks, including none) as a line of its own, outside
+the input echo and after the last echo block has ended. The banner in a
+deck comment, on an echoed line, inside a longer line, or before the
+echo does not count.
+
 The `.engrad` parser reads, in order, the atom count, the energy in Eh,
 3N gradient components in Eh/bohr, and the atomic numbers with Bohr
 coordinates. Each value must be a whole token and text from `#` to the

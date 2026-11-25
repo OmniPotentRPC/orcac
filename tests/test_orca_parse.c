@@ -132,9 +132,74 @@ static void test_scf_banner(const char *root) {
         "empty input not flagged");
 }
 
+/*
+ * Synthetic output with echo_line as an echoed deck line and tail
+ * after the echo block ends.
+ */
+static int terminated(const char *echo_line, const char *tail) {
+  char text[2048];
+  snprintf(text, sizeof(text),
+           "Synthetic orcac test text. Not output of an ORCA run.\n"
+           "      INPUT FILE\n"
+           "|  1> %s\n"
+           "|  2>        ****END OF INPUT****\n"
+           "TOTAL SCF ENERGY\n"
+           "%s",
+           echo_line, tail);
+  return orcac_terminated_normally(text);
+}
+
+static void test_termination_banner(const char *root) {
+  char *text = fixture(root, "replay.stdout");
+  CHECK(text != NULL && orcac_terminated_normally(text),
+        "replay fixture terminates normally");
+  free(text);
+  text = fixture(root, "term_echo_comment.stdout");
+  CHECK(text != NULL && !orcac_terminated_normally(text),
+        "banner echoed from the input counted");
+  free(text);
+
+  CHECK(terminated("# comment", "ORCA TERMINATED NORMALLY\n"),
+        "bare banner after the echo");
+  CHECK(terminated("# comment",
+                   "              ****ORCA TERMINATED NORMALLY****\n"
+                   "TOTAL RUN TIME: 0 days 0 hours 0 minutes 1 seconds\n"),
+        "starred banner after the echo");
+  CHECK(terminated("# comment", "ORCA TERMINATED NORMALLY"),
+        "banner without a final newline");
+  CHECK(!terminated("# ****ORCA TERMINATED NORMALLY****", ""),
+        "banner in an echoed comment counted");
+  CHECK(!terminated("****ORCA TERMINATED NORMALLY****", ""),
+        "banner as an echoed deck line counted");
+  CHECK(!terminated("# comment", "note: ORCA TERMINATED NORMALLY later\n"),
+        "banner inside a longer line counted");
+  CHECK(!terminated("# comment", "orca terminated normally\n"),
+        "lower-case banner counted");
+  CHECK(!terminated("# comment", "ORCA TERMINATED NORMALLY.\n"),
+        "banner with trailing text counted");
+  CHECK(!terminated("# comment", "|  9> ORCA TERMINATED NORMALLY\n"),
+        "echo-prefixed banner after the echo counted");
+  CHECK(!orcac_terminated_normally(
+            "ORCA TERMINATED NORMALLY\n    INPUT FILE\n| 1> x\n"
+            "|  2>        ****END OF INPUT****\nSCF ITERATIONS\n"),
+        "banner before the input echo counted");
+  CHECK(!orcac_terminated_normally(
+            "    INPUT FILE\n| 1> x\nORCA TERMINATED NORMALLY\n"),
+        "banner inside an unterminated echo block counted");
+  CHECK(!orcac_terminated_normally(
+            "    INPUT FILE\n"
+            "ORCA TERMINATED NORMALLY\n"
+            "|  2>        ****END OF INPUT****\n"),
+        "unprefixed banner inside the echo block counted");
+  CHECK(!orcac_terminated_normally("ORCA TERMINATED\n") &&
+            !orcac_terminated_normally("") && !orcac_terminated_normally(NULL),
+        "partial or empty text counted");
+}
+
 int main(int argc, char **argv) {
   const char *root = argc > 1 ? argv[1] : ".";
   test_scf_banner(root);
+  test_termination_banner(root);
   if (failures != 0) {
     fprintf(stderr, "%d check(s) failed\n", failures);
     return 1;

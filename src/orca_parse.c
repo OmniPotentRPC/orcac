@@ -358,41 +358,62 @@ static int line_has_any(const char *line, const char *end,
 }
 
 /*
- * The input echo, from the "INPUT FILE" header to "****END OF INPUT****"
- * and every "|  n>" line, is skipped, so a comment in the deck cannot
- * read as a banner. Other "not converged" lines, such as a geometry
- * optimisation's, do not count.
+ * Walks ORCA output by line, skipping the input echo: the block from the
+ * "INPUT FILE" header to "****END OF INPUT****" and every "|  n>" line.
+ * Text after an echo block that never ends is skipped too. echo_starts
+ * counts the echo blocks entered so far.
+ */
+typedef struct OutputLines {
+  const char *at;
+  int in_input;
+  int echo_starts;
+} OutputLines;
+
+static int next_output_line(OutputLines *it, const char **line_out,
+                            const char **end_out) {
+  while (*it->at != '\0') {
+    const char *line = it->at;
+    const char *end = strchr(line, '\n');
+    if (end == NULL) {
+      end = line + strlen(line);
+    }
+    it->at = *end == '\n' ? end + 1 : end;
+    if (it->in_input) {
+      if (line_has(line, end, "****end of input****")) {
+        it->in_input = 0;
+      }
+      continue;
+    }
+    if (line_is(line, end, "input file")) {
+      it->in_input = 1;
+      ++it->echo_starts;
+      continue;
+    }
+    if (is_echo_line(line, end)) {
+      continue;
+    }
+    *line_out = line;
+    *end_out = end;
+    return 1;
+  }
+  return 0;
+}
+
+/*
+ * A comment in the echoed deck cannot read as a banner. Other "not
+ * converged" lines, such as a geometry optimisation's, do not count.
  */
 int orcac_scf_not_converged(const char *text) {
-  const char *line = text;
-  int in_input = 0;
+  OutputLines it;
+  const char *line;
+  const char *end;
   int in_scf = 0;
   if (text == NULL) {
     return 0;
   }
-  while (*line != '\0') {
-    const char *end = strchr(line, '\n');
-    const char *next;
-    if (end == NULL) {
-      end = line + strlen(line);
-    }
-    next = *end == '\n' ? end + 1 : end;
-    if (in_input) {
-      if (line_has(line, end, "****end of input****")) {
-        in_input = 0;
-      }
-      line = next;
-      continue;
-    }
-    if (line_is(line, end, "input file")) {
-      in_input = 1;
-      line = next;
-      continue;
-    }
-    if (is_echo_line(line, end)) {
-      line = next;
-      continue;
-    }
+  memset(&it, 0, sizeof(it));
+  it.at = text;
+  while (next_output_line(&it, &line, &end)) {
     if (line_has_any(line, end, kScfBanners, N_OF(kScfBanners))) {
       return 1;
     }
@@ -405,11 +426,45 @@ int orcac_scf_not_converged(const char *text) {
         line_has_any(line, end, kScfRegionPhrases, N_OF(kScfRegionPhrases))) {
       return 1;
     }
-    line = next;
   }
   return 0;
 }
 
+/*
+ * 1 when [line, end) is ORCA's banner, "****ORCA TERMINATED NORMALLY****",
+ * with any number of asterisks, including none, and blanks around it.
+ */
+static int is_termination_banner(const char *line, const char *end) {
+  static const char kBanner[] = "ORCA TERMINATED NORMALLY";
+  while (line < end && (isspace((unsigned char)*line) || *line == '*')) {
+    ++line;
+  }
+  while (end > line && (isspace((unsigned char)end[-1]) || end[-1] == '*')) {
+    --end;
+  }
+  return (size_t)(end - line) == sizeof(kBanner) - 1u &&
+         memcmp(line, kBanner, sizeof(kBanner) - 1u) == 0;
+}
+
+/*
+ * The banner counts only as a line of its own outside the input echo,
+ * and only after the last echo block has ended, so neither the echoed
+ * deck nor anything printed before the echo can supply it.
+ */
 int orcac_terminated_normally(const char *text) {
-  return text != NULL && strstr(text, "ORCA TERMINATED NORMALLY") != NULL;
+  OutputLines it;
+  const char *line;
+  const char *end;
+  int found_after = -1;
+  if (text == NULL) {
+    return 0;
+  }
+  memset(&it, 0, sizeof(it));
+  it.at = text;
+  while (next_output_line(&it, &line, &end)) {
+    if (is_termination_banner(line, end)) {
+      found_after = it.echo_starts;
+    }
+  }
+  return !it.in_input && found_after >= 0 && found_after == it.echo_starts;
 }

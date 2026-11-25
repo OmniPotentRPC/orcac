@@ -26,5 +26,8 @@ char *orcac_file_tail(const char *path, size_t max_bytes);
  */
 int orcac_scf_not_converged(const char *text);
 
-/* 1 when ORCA output text carries its normal-termination banner. */
+/*
+ * 1 when ORCA output text carries its normal-termination banner as a
+ * line of its own after the input echo has ended.
+ */
 int orcac_terminated_normally(const char *text);
