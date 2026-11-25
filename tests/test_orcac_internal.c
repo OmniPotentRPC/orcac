@@ -486,7 +486,12 @@ static int entry_count(const char *dir) {
   return n;
 }
 
-enum { SWAP_FOR_SYMLINK = 1, MOVE_OUT = 2, MOVE_ANCESTOR = 3 };
+enum {
+  SWAP_FOR_SYMLINK = 1,
+  MOVE_OUT = 2,
+  MOVE_ANCESTOR = 3,
+  RENAME_ANCESTOR = 4
+};
 static int swap_mode = 0;
 static int swap_calls = 0;
 static const char *swap_trigger = "a";
@@ -497,7 +502,8 @@ static char swap_root[PATH_MAX + 16];
 /*
  * Runs once the walk reaches swap_trigger: after opening it when it is a
  * directory, before unlinking it otherwise. MOVE_ANCESTOR renames root/a,
- * an ancestor of the trigger, out of the tree by path.
+ * an ancestor of the trigger, out of the tree by path; RENAME_ANCESTOR
+ * renames it to root/swap_dest, inside the tree.
  */
 static void swap_on_open(int dirfd, const char *name) {
   char from[PATH_MAX + 64];
@@ -512,6 +518,10 @@ static void swap_on_open(int dirfd, const char *name) {
           "swap a for a symlink");
   } else if (swap_mode == MOVE_OUT) {
     CHECK(renameat(dirfd, "a", AT_FDCWD, moved) == 0, "move a out");
+  } else if (swap_mode == RENAME_ANCESTOR) {
+    snprintf(from, sizeof(from), "%s/a", swap_root);
+    snprintf(moved, sizeof(moved), "%s/%s", swap_root, swap_dest);
+    CHECK(rename(from, moved) == 0, "rename the ancestor a in the root");
   } else {
     snprintf(from, sizeof(from), "%s/a", swap_root);
     CHECK(rename(from, moved) == 0, "move the ancestor a out");
@@ -535,17 +545,18 @@ static void refill_on_scan(int dirfd, const char *name) {
 }
 
 /*
- * root/a/{f1,f2,b/g}; the hook moves root/a out of the root when the walk
- * reaches trigger. Returns the remover's result with errno.
+ * root/a/{f1,f2,b/g}; the hook moves or renames root/a, as mode says,
+ * when the walk reaches trigger. Returns the remover's result with
+ * errno.
  */
-static int race_ancestor_move(const char *root, const char *trigger,
-                              const char *dest) {
+static int race_ancestor(int mode, const char *root, const char *trigger,
+                         const char *dest) {
   char path[PATH_MAX + 64];
   int fd;
   int rc;
   snprintf(path, sizeof(path), "%s/a", root);
   make_tree(path);
-  swap_mode = MOVE_ANCESTOR;
+  swap_mode = mode;
   swap_calls = 0;
   swap_trigger = trigger;
   swap_dest = dest;
@@ -669,7 +680,7 @@ static void test_remove_tree(void) {
    * root/a is renamed out after the walk opened root/a/b: b still sits in
    * a, so only a check of the whole chain up to the root sees the move.
    */
-  rc = race_ancestor_move(root, "b", "moved-desc");
+  rc = race_ancestor(MOVE_ANCESTOR, root, "b", "moved-desc");
   CHECK(swap_calls == 1, "descent race hook not reached");
   CHECK(rc != 0 && errno == EXDEV,
         "walk descended into a subtree whose ancestor moved out");
@@ -679,7 +690,7 @@ static void test_remove_tree(void) {
   CHECK(tree_intact(outside), "outside tree touched by the descent race");
 
   /* The same move just before a file in root/a/b is unlinked. */
-  rc = race_ancestor_move(root, "g", "moved-file");
+  rc = race_ancestor(MOVE_ANCESTOR, root, "g", "moved-file");
   CHECK(swap_calls == 1, "unlink race hook not reached");
   CHECK(rc != 0 && errno == EXDEV,
         "walk unlinked in a subtree whose ancestor moved out");
@@ -687,6 +698,25 @@ static void test_remove_tree(void) {
   CHECK(file_is(moved, "b/g", "g"),
         "file below a moved-out ancestor unlinked");
   CHECK(tree_intact(outside), "outside tree touched by the unlink race");
+
+  /*
+   * root/a is renamed to root/a2 just before root/a/b/g is unlinked. b
+   * still sits below the root through "..", but "a" no longer names the
+   * directory the walk pinned, so the walk stops there.
+   */
+  rc = race_ancestor(RENAME_ANCESTOR, root, "g", "a2");
+  CHECK(swap_calls == 1, "rename race hook not reached");
+  CHECK(rc != 0 && errno == EXDEV,
+        "walk unlinked below an ancestor no longer at its pinned name");
+  snprintf(path, sizeof(path), "%s/a2", root);
+  CHECK(file_is(path, "b/g", "g"),
+        "file below a renamed ancestor unlinked");
+  fd = open(root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  CHECK(fd >= 0 && orcac_empty_dir(fd) == 0 && entry_count(root) == 0,
+        "empty the root after the rename race");
+  if (fd >= 0) {
+    close(fd);
+  }
 
   /* Files that keep reappearing outlast the passes: -1 and EAGAIN. */
   snprintf(path, sizeof(path), "%s/n0", root);

@@ -549,7 +549,27 @@ void (*orcac_test_remove_hook)(int dirfd, const char *name) = NULL;
 /* Retries when an entry changes type between open and unlink. */
 #define ORCAC_REMOVE_MAX_TRIES 4
 
-static int empty_dir_fd(int fd, const struct stat *root, int level);
+#ifndef NAME_MAX
+#define NAME_MAX 255
+#endif
+
+#define REMOVE_DIR_FLAGS (O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+
+/*
+ * The directories from the root down to the one being emptied, each
+ * held open. fd[0] is the root; fd[i] was opened from fd[i-1] through
+ * name[i] with O_NOFOLLOW and was dev[i], ino[i] then. Every open,
+ * stat and unlink of the walk is relative to one of these descriptors.
+ */
+typedef struct RemoveChain {
+  int depth;
+  int fd[ORCAC_REMOVE_MAX_DEPTH + 1];
+  dev_t dev[ORCAC_REMOVE_MAX_DEPTH + 1];
+  ino_t ino[ORCAC_REMOVE_MAX_DEPTH + 1];
+  char name[ORCAC_REMOVE_MAX_DEPTH + 1][NAME_MAX + 1];
+} RemoveChain;
+
+static int empty_dir_fd(RemoveChain *c);
 
 static int keep_errno(int first, int now) {
   return first != 0 ? first : now;
@@ -558,10 +578,6 @@ static int keep_errno(int first, int now) {
 static int is_dot_name(const char *name) {
   return name[0] == '.' &&
          (name[1] == '\0' || (name[1] == '.' && name[2] == '\0'));
-}
-
-static int same_inode(const struct stat *a, const struct stat *b) {
-  return a->st_dev == b->st_dev && a->st_ino == b->st_ino;
 }
 
 static void call_remove_hook(int dirfd, const char *name) {
@@ -575,61 +591,65 @@ static void call_remove_hook(int dirfd, const char *name) {
 #endif
 }
 
-/*
- * 1 while the directory open at fd is exactly level steps below the
- * pinned root, following ".." through descriptors on the root's device.
- * Checking the whole chain, not only the parent, means a subtree whose
- * ancestor was renamed out of the tree mid-walk is no longer touched.
- * errno is left as it was.
- */
-static int below_root(int fd, const struct stat *root, int level) {
+/* 1 while name in dirfd is the directory dev, ino. errno is kept. */
+static int entry_is(int dirfd, const char *name, dev_t dev, ino_t ino) {
   int saved = errno;
-  int cur = fd;
-  int ok = 0;
   struct stat st;
-  if (level == 0) {
-    ok = fstat(fd, &st) == 0 && same_inode(&st, root);
-    errno = saved;
-    return ok;
-  }
-  for (int hop = 1; hop <= level; ++hop) {
-    int up;
-    if (hop == level) {
-      ok = fstatat(cur, "..", &st, AT_SYMLINK_NOFOLLOW) == 0 &&
-           same_inode(&st, root);
-      break;
-    }
-    up = openat(cur, "..", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    if (cur != fd) {
-      close(cur);
-    }
-    cur = up;
-    if (cur < 0 || fstat(cur, &st) != 0 || st.st_dev != root->st_dev ||
-        same_inode(&st, root)) {
-      break;
-    }
-  }
-  if (cur >= 0 && cur != fd) {
-    close(cur);
-  }
+  int ok = fstatat(dirfd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 &&
+           S_ISDIR(st.st_mode) && st.st_dev == dev && st.st_ino == ino;
   errno = saved;
   return ok;
 }
 
 /*
- * Remove name, and everything below it, from the directory open at
- * dirfd, which sits level steps below root. Every unlink and every
- * descent is preceded by a fresh below_root check.
+ * 1 while every pinned directory is still the entry its pinned parent
+ * holds under the name it was opened by, so none of them, nor any
+ * ancestor, has been renamed out from under the root. errno is kept.
  */
-static int remove_entry_at(int dirfd, const struct stat *root, int level,
-                           const char *name) {
+static int chain_intact(const RemoveChain *c) {
+  for (int i = 1; i <= c->depth; ++i) {
+    if (!entry_is(c->fd[i - 1], c->name[i], c->dev[i], c->ino[i])) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int chain_push(RemoveChain *c, int fd, const struct stat *st,
+                      const char *name) {
+  size_t n = strlen(name);
+  if (n > NAME_MAX || c->depth >= ORCAC_REMOVE_MAX_DEPTH) {
+    errno = n > NAME_MAX ? ENAMETOOLONG : ELOOP;
+    return -1;
+  }
+  ++c->depth;
+  c->fd[c->depth] = fd;
+  c->dev[c->depth] = st->st_dev;
+  c->ino[c->depth] = st->st_ino;
+  memcpy(c->name[c->depth], name, n + 1u);
+  return 0;
+}
+
+/*
+ * Remove name, and everything below it, from the deepest pinned
+ * directory. Every unlink and every descent is preceded by a fresh
+ * chain_intact check, and a subdirectory is only entered once its fd
+ * is confirmed as the entry it was opened through.
+ */
+static int remove_entry_at(RemoveChain *c, const char *name) {
+  int dirfd = c->fd[c->depth];
+  int lost = 0;
   for (int tries = 0; tries < ORCAC_REMOVE_MAX_TRIES; ++tries) {
     struct stat st;
     int rc;
-    int fd = openat(dirfd, name,
-                    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    int fd = openat(dirfd, name, REMOVE_DIR_FLAGS);
     if (fd < 0) {
       if (errno == ENOENT) {
+        /* A directory opened earlier left its entry: it went elsewhere. */
+        if (lost) {
+          errno = EXDEV;
+          return -1;
+        }
         return 0;
       }
       if (errno != ENOTDIR && errno != ELOOP) {
@@ -637,7 +657,7 @@ static int remove_entry_at(int dirfd, const struct stat *root, int level,
       }
       /* A file or a symlink: remove the entry itself. */
       call_remove_hook(dirfd, name);
-      if (!below_root(dirfd, root, level)) {
+      if (!chain_intact(c)) {
         errno = EXDEV;
         return -1;
       }
@@ -655,24 +675,39 @@ static int remove_entry_at(int dirfd, const struct stat *root, int level,
       errno = saved;
       return -1;
     }
-    if (st.st_dev != root->st_dev || level + 1 > ORCAC_REMOVE_MAX_DEPTH) {
+    if (st.st_dev != c->dev[0] || c->depth + 1 > ORCAC_REMOVE_MAX_DEPTH) {
       close(fd);
-      errno = st.st_dev != root->st_dev ? EXDEV : ELOOP;
+      errno = st.st_dev != c->dev[0] ? EXDEV : ELOOP;
       return -1;
     }
     call_remove_hook(dirfd, name);
-    if (!below_root(fd, root, level + 1)) {
+    if (!chain_intact(c)) {
       close(fd);
       errno = EXDEV;
       return -1;
     }
-    rc = empty_dir_fd(fd, root, level + 1);
+    if (!entry_is(dirfd, name, st.st_dev, st.st_ino)) {
+      close(fd);
+      lost = 1;
+      continue;
+    }
+    if (chain_push(c, fd, &st, name) != 0) {
+      int saved = errno;
+      close(fd);
+      errno = saved;
+      return -1;
+    }
+    rc = empty_dir_fd(c);
+    --c->depth;
     if (rc != 0) {
       return -1;
     }
-    if (!below_root(dirfd, root, level)) {
+    if (!chain_intact(c)) {
       errno = EXDEV;
       return -1;
+    }
+    if (!entry_is(dirfd, name, st.st_dev, st.st_ino)) {
+      continue;
     }
     if (unlinkat(dirfd, name, AT_REMOVEDIR) == 0 || errno == ENOENT) {
       return 0;
@@ -680,21 +715,20 @@ static int remove_entry_at(int dirfd, const struct stat *root, int level,
     if (errno != ENOTDIR) {
       return -1;
     }
-    /* Swapped for a non-directory after it was opened: go again. */
   }
   errno = EAGAIN;
   return -1;
 }
 
 /*
- * Remove every entry of the directory open at fd, level steps below
- * root, and close fd. Each entry is opened relative to fd with
- * O_NOFOLLOW, so a symlink is unlinked itself and a directory swapped
- * for a symlink is never entered. The walk stops once fd is no longer
- * where it was below root. Entries still present after the last pass
- * are -1 with EAGAIN.
+ * Remove every entry of the deepest pinned directory and close its fd.
+ * Each entry is opened relative to it with O_NOFOLLOW, so a symlink is
+ * unlinked itself and a directory swapped for a symlink is never
+ * entered. The walk stops once the chain is no longer intact. Entries
+ * still present after the last pass are -1 with EAGAIN.
  */
-static int empty_dir_fd(int fd, const struct stat *root, int level) {
+static int empty_dir_fd(RemoveChain *c) {
+  int fd = c->fd[c->depth];
   DIR *dir = fdopendir(fd);
   int first = 0;
   int empty = 0;
@@ -709,7 +743,7 @@ static int empty_dir_fd(int fd, const struct stat *root, int level) {
     int seen = 0;
     int removed = 0;
     rewinddir(dir);
-    call_remove_hook(dirfd(dir), NULL);
+    call_remove_hook(fd, NULL);
     for (;;) {
       errno = 0;
       ent = readdir(dir);
@@ -723,11 +757,11 @@ static int empty_dir_fd(int fd, const struct stat *root, int level) {
         continue;
       }
       ++seen;
-      if (!below_root(dirfd(dir), root, level)) {
+      if (!chain_intact(c)) {
         first = keep_errno(first, EXDEV);
         break;
       }
-      if (remove_entry_at(dirfd(dir), root, level, ent->d_name) == 0) {
+      if (remove_entry_at(c, ent->d_name) == 0) {
         ++removed;
       } else {
         first = keep_errno(first, errno);
@@ -744,7 +778,7 @@ static int empty_dir_fd(int fd, const struct stat *root, int level) {
   if (first == 0 && !empty) {
     struct dirent *ent;
     rewinddir(dir);
-    call_remove_hook(dirfd(dir), NULL);
+    call_remove_hook(fd, NULL);
     errno = 0;
     while ((ent = readdir(dir)) != NULL && is_dot_name(ent->d_name)) {
     }
@@ -758,9 +792,114 @@ static int empty_dir_fd(int fd, const struct stat *root, int level) {
   return 0;
 }
 
+static RemoveChain *chain_new(int root_fd, const struct stat *root) {
+  RemoveChain *c = (RemoveChain *)malloc(sizeof(*c));
+  if (c == NULL) {
+    errno = ENOMEM;
+    return NULL;
+  }
+  c->depth = 0;
+  c->fd[0] = root_fd;
+  c->dev[0] = root->st_dev;
+  c->ino[0] = root->st_ino;
+  c->name[0][0] = '\0';
+  return c;
+}
+
+/* The name under which parent_fd holds the directory child, into out. */
+static int child_name(int parent_fd, const struct stat *child, char *out) {
+  int found = -1;
+  int fd = openat(parent_fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  DIR *dir = fd >= 0 ? fdopendir(fd) : NULL;
+  struct dirent *ent;
+  if (dir == NULL) {
+    if (fd >= 0) {
+      close(fd);
+    }
+    return -1;
+  }
+  while (found != 0 && (ent = readdir(dir)) != NULL) {
+    size_t n = strlen(ent->d_name);
+    if (!is_dot_name(ent->d_name) && n <= NAME_MAX &&
+        entry_is(parent_fd, ent->d_name, child->st_dev, child->st_ino)) {
+      memcpy(out, ent->d_name, n + 1u);
+      found = 0;
+    }
+  }
+  closedir(dir);
+  return found;
+}
+
+/*
+ * Pin the chain from root down to dirfd, which must sit exactly level
+ * steps below it. The names are learned by climbing "..", but only the
+ * directories reached by opening those names downward from root_fd
+ * with O_NOFOLLOW, and found to be the ones seen on the climb, are
+ * kept. On success fd[1..level] are open and belong to the chain.
+ */
+static int chain_pin_to(RemoveChain *c, int dirfd, int level) {
+  struct stat child;
+  int cur = dirfd;
+  int ok = 1;
+  if (fstat(dirfd, &child) != 0) {
+    return -1;
+  }
+  for (int i = level; i >= 1 && ok; --i) {
+    struct stat up_st;
+    int up = openat(cur, "..", REMOVE_DIR_FLAGS);
+    if (cur != dirfd) {
+      close(cur);
+    }
+    cur = up;
+    ok = cur >= 0 && fstat(cur, &up_st) == 0 &&
+         up_st.st_dev == c->dev[0] &&
+         (up_st.st_ino == c->ino[0]) == (i == 1) &&
+         child_name(cur, &child, c->name[i]) == 0;
+    if (ok) {
+      c->dev[i] = child.st_dev;
+      c->ino[i] = child.st_ino;
+      child = up_st;
+    }
+  }
+  if (cur >= 0 && cur != dirfd) {
+    close(cur);
+  }
+  if (level == 0) {
+    ok = child.st_dev == c->dev[0] && child.st_ino == c->ino[0];
+  }
+  for (int i = 1; i <= level && ok; ++i) {
+    struct stat st;
+    int fd = openat(c->fd[i - 1], c->name[i], REMOVE_DIR_FLAGS);
+    if (fd < 0) {
+      ok = 0;
+      break;
+    }
+    if (fstat(fd, &st) != 0 || st.st_dev != c->dev[i] ||
+        st.st_ino != c->ino[i]) {
+      close(fd);
+      ok = 0;
+      break;
+    }
+    c->fd[i] = fd;
+    c->depth = i;
+  }
+  if (!ok) {
+    for (int i = 1; i <= c->depth; ++i) {
+      close(c->fd[i]);
+    }
+    c->depth = 0;
+    errno = EXDEV;
+    return -1;
+  }
+  return 0;
+}
+
 int orcac_empty_dir(int dirfd) {
   struct stat st;
+  RemoveChain *c;
   int fd;
+  int rc;
+  int saved;
   if (dirfd < 0 || fstat(dirfd, &st) != 0) {
     return -1;
   }
@@ -772,12 +911,25 @@ int orcac_empty_dir(int dirfd) {
   if (fd < 0) {
     return -1;
   }
-  return empty_dir_fd(fd, &st, 0);
+  c = chain_new(fd, &st);
+  if (c == NULL) {
+    close(fd);
+    errno = ENOMEM;
+    return -1;
+  }
+  rc = empty_dir_fd(c);
+  saved = errno;
+  free(c);
+  errno = saved;
+  return rc;
 }
 
 int orcac_remove_tree_below(int root_fd, int dirfd, int level,
                             const char *name) {
   struct stat root;
+  RemoveChain *c;
+  int rc;
+  int saved;
   if (root_fd < 0 || dirfd < 0 || level < 0 ||
       level >= ORCAC_REMOVE_MAX_DEPTH || name == NULL || name[0] == '\0' ||
       is_dot_name(name) || strchr(name, '/') != NULL) {
@@ -791,11 +943,23 @@ int orcac_remove_tree_below(int root_fd, int dirfd, int level,
     errno = ENOTDIR;
     return -1;
   }
-  if (!below_root(dirfd, &root, level)) {
+  c = chain_new(root_fd, &root);
+  if (c == NULL) {
+    return -1;
+  }
+  if (chain_pin_to(c, dirfd, level) != 0) {
+    free(c);
     errno = EXDEV;
     return -1;
   }
-  return remove_entry_at(dirfd, &root, level, name);
+  rc = remove_entry_at(c, name);
+  saved = errno;
+  for (int i = 1; i <= c->depth; ++i) {
+    close(c->fd[i]);
+  }
+  free(c);
+  errno = saved;
+  return rc;
 }
 
 int orcac_remove_tree_at(int dirfd, const char *name) {

@@ -86,13 +86,17 @@ int orcac_run_orca(const char *executable,
  * Remove the entry name of the directory open at dirfd, which must sit
  * exactly level steps below the directory open at root_fd, and
  * everything below it. name is one path component. Nothing is done by
- * path: the walk holds a descriptor per level, opens each entry
- * relative to its parent with O_NOFOLLOW, and before every descent and
- * every unlinkat follows ".." back to root_fd's device and inode. A
- * symlink is unlinked and its target left alone, a directory swapped
- * for a symlink mid-walk is never entered, and once a subtree or any of
- * its ancestors has been moved out from under root_fd, or an entry sits
- * on another device, the rest is left in place with -1 and EXDEV.
+ * path: the walk pins a descriptor per level, from root_fd down, each
+ * opened from its pinned parent with O_DIRECTORY | O_NOFOLLOW, and
+ * every openat, fstatat and unlinkat is relative to one of them. Before
+ * every descent and every unlinkat each pinned level is checked to be
+ * still the entry its pinned parent holds under its name. The chain to
+ * dirfd is pinned the same way first, downward from root_fd. A symlink
+ * is unlinked and its target left alone, a directory swapped for a
+ * symlink mid-walk is never entered, and once a subtree or any of its
+ * ancestors has been moved out from under its pinned parent, or an
+ * entry sits on another device, the rest is left in place with -1 and
+ * EXDEV.
  * A directory that still holds entries after a bounded number of passes,
  * because new ones keep appearing, is -1 with EAGAIN. A missing entry is
  * 0. On -1, errno holds the first failure.
