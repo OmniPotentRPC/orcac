@@ -250,6 +250,7 @@ OrcaCResult orcac_compute(OrcaCPot *pot, int n_atoms, const double *positions_an
   char *gbw = NULL;
   char guess_name[ORCAC_GUESS_NAME_SIZE];
   OrcacChildResult child;
+  OrcacRunOptions run_options;
   OrcacEngrad parsed;
   int guess_slot = -1;
 
@@ -309,8 +310,12 @@ OrcaCResult orcac_compute(OrcaCPot *pot, int n_atoms, const double *positions_an
     goto fail;
   }
 
+  run_options.timeout_s = (double)pot->config.timeout_s;
+  run_options.envp = NULL;
+  run_options.cancel_gen = NULL;
+  run_options.cancel_seen = 0;
   if (orcac_run_orca(pot->resolved_exe, pot->run_dir, "orcac.inp", out, err,
-                     pot->config.timeout_s, &child, pot->last_error,
+                     &run_options, &child, pot->last_error,
                      sizeof(pot->last_error)) != 0) {
     goto fail;
   }

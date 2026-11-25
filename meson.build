@@ -14,7 +14,7 @@ math_dep = cc.find_library('m', required: false)
 
 common_c_args = [
   '-DORCAC_VERSION_STRING="' + meson.project_version() + '"',
-  '-D_POSIX_C_SOURCE=200809L',
+  '-D_XOPEN_SOURCE=700',
 ]
 if cc.get_id() != 'msvc'
   common_c_args += ['-Wall', '-Wextra', '-Wpedantic']
