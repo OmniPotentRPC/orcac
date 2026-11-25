@@ -23,6 +23,10 @@
 #   ORCAC_FAKE_ENGRAD        fixture copied as the .engrad instead of
 #                            replay.engrad
 #   ORCAC_FAKE_STDOUT        fixture printed instead of replay.stdout
+#   ORCAC_FAKE_ECHO_INPUT    print an input echo block, "|  n> line" for
+#                            each deck line, before the fixture output
+#   ORCAC_FAKE_GBW_LINK      write the .gbw as a symlink to this path
+#   ORCAC_FAKE_ENGRAD_LINK   write the .engrad as a symlink to this path
 set -u
 
 log=${ORCAC_FAKE_LOG:-}
@@ -82,6 +86,17 @@ if [ -z "$replay" ]; then
   echo "fake orca: ORCAC_FAKE_REPLAY is unset" >&2
   exit 2
 fi
+if [ -n "${ORCAC_FAKE_ECHO_INPUT:-}" ]; then
+  printf '%s\n' '==========' '                INPUT FILE' '==========' \
+    "NAME = $inp"
+  n=0
+  while IFS= read -r l || [ -n "$l" ]; do
+    n=$((n + 1))
+    printf '|%3d> %s\n' "$n" "$l"
+  done < "$inp"
+  printf '|%3d>                  ****END OF INPUT****\n' "$((n + 1))"
+  printf '%s\n' '=========='
+fi
 noconv=${ORCAC_FAKE_NOCONV:-}
 if [ -n "${ORCAC_FAKE_FAIL_MOREAD:-}" ] && /bin/grep -q 'MORead' "$inp"; then
   noconv=1
@@ -94,7 +109,15 @@ if [ -n "$noconv" ]; then
   fi
   exit "$noconv"
 fi
-/bin/cp "$replay/${ORCAC_FAKE_ENGRAD:-replay.engrad}" "${base}.engrad"
+if [ -n "${ORCAC_FAKE_ENGRAD_LINK:-}" ]; then
+  /bin/ln -s "${ORCAC_FAKE_ENGRAD_LINK}" "${base}.engrad"
+else
+  /bin/cp "$replay/${ORCAC_FAKE_ENGRAD:-replay.engrad}" "${base}.engrad"
+fi
 /bin/cat "$replay/${ORCAC_FAKE_STDOUT:-replay.stdout}"
-printf 'gbw' > "${base}.gbw"
+if [ -n "${ORCAC_FAKE_GBW_LINK:-}" ]; then
+  /bin/ln -s "${ORCAC_FAKE_GBW_LINK}" "${base}.gbw"
+else
+  printf 'gbw' > "${base}.gbw"
+fi
 exit 0

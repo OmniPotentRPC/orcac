@@ -939,6 +939,30 @@ static void test_malformed_output(void) {
 }
 
 /*
+ * A deck comment in blocks holding the banner is echoed by ORCA; with no
+ * real banner after the echo the exit-0 run must still fail.
+ */
+static void test_banner_in_blocks(void) {
+  OrcaCConfig cfg = base_config();
+  OrcaCSession *s;
+  cfg.blocks = "# ORCA TERMINATED NORMALLY\n%scf MaxIter 100 end";
+  s = make(&cfg);
+  CHECK(s != NULL, "create with a banner comment in blocks");
+  if (s == NULL) {
+    return;
+  }
+  setenv("ORCAC_FAKE_ECHO_INPUT", "1", 1);
+  expect_eval(s, ORCAC_OK, "echoed banner comment with the real banner",
+              NULL);
+  setenv("ORCAC_FAKE_STDOUT", "truncated.stdout", 1);
+  expect_eval(s, ORCAC_E_ERROR, "banner only in the echoed blocks comment",
+              "lacks the normal termination banner");
+  unsetenv("ORCAC_FAKE_STDOUT");
+  unsetenv("ORCAC_FAKE_ECHO_INPUT");
+  orcac_destroy(s);
+}
+
+/*
  * Run a failing fake with some of the caller's standard descriptors
  * closed, in a child process; ORCA's stdout and stderr must still land
  * in the files orcac reads, and stdin must not alias either of them.
@@ -1100,6 +1124,23 @@ static void test_reaped_elsewhere(void) {
       bad |= 8;
     }
     unsetenv("ORCAC_FAKE_SLEEP");
+    orcac_destroy(s);
+    cfg.timeout_s = 0.0;
+    cfg.blocks = "# ORCA TERMINATED NORMALLY\n%scf MaxIter 100 end";
+    if (orcac_create(&cfg, &s, NULL, 0) != ORCAC_OK) {
+      _exit(65);
+    }
+    setenv("ORCAC_FAKE_ECHO_INPUT", "1", 1);
+    setenv("ORCAC_FAKE_STDOUT", "truncated.stdout", 1);
+    if (eval(s, &e, g, &meta) != ORCAC_E_ERROR ||
+        strstr(orcac_last_error(s), "reaped by another waiter") == NULL) {
+      bad |= 16;
+    }
+    unsetenv("ORCAC_FAKE_STDOUT");
+    if (!replay_ok(eval(s, &e, g, &meta), &e, g)) {
+      bad |= 32;
+    }
+    unsetenv("ORCAC_FAKE_ECHO_INPUT");
     orcac_destroy(s);
     _exit(bad);
   }
@@ -1294,6 +1335,9 @@ int main(int argc, char **argv) {
   unsetenv("ORCAC_FAKE_ENGRAD");
   unsetenv("ORCAC_FAKE_STDOUT");
   unsetenv("ORCAC_FAKE_FD_LOG");
+  unsetenv("ORCAC_FAKE_ECHO_INPUT");
+  unsetenv("ORCAC_FAKE_GBW_LINK");
+  unsetenv("ORCAC_FAKE_ENGRAD_LINK");
 
   test_config_header();
   test_additive_layouts();
@@ -1306,6 +1350,7 @@ int main(int argc, char **argv) {
   test_guess_invalidation();
   test_guess_key();
   test_malformed_output();
+  test_banner_in_blocks();
   test_fd_hygiene();
   test_reaped_elsewhere();
   test_mpi_env();
