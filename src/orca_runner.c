@@ -159,7 +159,10 @@ static void random_suffix(char *out, size_t n, unsigned int attempt) {
   if (got < n) {
     struct timespec now;
     unsigned long long x;
-    clock_gettime(CLOCK_REALTIME, &now);
+    if (clock_gettime(CLOCK_REALTIME, &now) != 0) {
+      now.tv_sec = time(NULL);
+      now.tv_nsec = 0;
+    }
     x = mix64(((unsigned long long)now.tv_sec << 32) ^
               (unsigned long long)now.tv_nsec ^
               ((unsigned long long)getpid() << 16) ^ attempt ^
