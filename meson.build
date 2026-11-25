@@ -57,6 +57,17 @@ if get_option('with_tests')
   )
   test('stub_abi', test_stub)
 
+  test_replay = executable(
+    'test_orcac_replay',
+    'tests/test_orcac_replay.c',
+    include_directories: inc,
+    link_with: liborcac,
+    dependencies: [math_dep],
+    c_args: common_c_args,
+  )
+  test('replay_orca_output', test_replay,
+       args: [meson.current_source_dir()])
+
   test(
     'readme-abi-surface',
     python,
