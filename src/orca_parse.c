@@ -297,15 +297,41 @@ static int line_has(const char *line, const char *end, const char *needle) {
   return 0;
 }
 
+/* isspace without the locale; '\n' never occurs inside a line. */
+static int is_blank(char c) {
+  return c == ' ' || c == '\t' || c == '\r' || c == '\v' || c == '\f';
+}
+
 /* 1 when [line, end) is word, in any case, with only blanks around it. */
 static int line_is(const char *line, const char *end, const char *word) {
-  while (line < end && isspace((unsigned char)*line)) {
+  while (line < end && is_blank(*line)) {
     ++line;
   }
-  while (end > line && isspace((unsigned char)end[-1])) {
+  while (end > line && is_blank(end[-1])) {
     --end;
   }
   return (size_t)(end - line) == strlen(word) && line_has(line, end, word);
+}
+
+/*
+ * 1 for a line that may sit inside the echo block between its header and
+ * the end marker without being an echoed deck line: blank, a rule of
+ * '=', or ORCA's "NAME = file" line.
+ */
+static int is_echo_frame_line(const char *line, const char *end) {
+  const char *p = line;
+  while (p < end && is_blank(*p)) {
+    ++p;
+  }
+  if (p < end && *p == '=') {
+    while (p < end && (*p == '=' || is_blank(*p))) {
+      ++p;
+    }
+    return p == end;
+  }
+  return p == end ||
+         ((size_t)(end - p) >= 4u && memcmp(p, "NAME", 4u) == 0 &&
+          line_has(p + 4, end, "="));
 }
 
 /* ORCA echoes each input line as "|  12> text". */
@@ -358,15 +384,18 @@ static int line_has_any(const char *line, const char *end,
 }
 
 /*
- * Walks ORCA output by line, skipping the input echo: the block from the
- * "INPUT FILE" header to "****END OF INPUT****" and every "|  n>" line.
- * Text after an echo block that never ends is skipped too. echo_starts
- * counts the echo blocks entered so far.
+ * Walks ORCA output by line, skipping the input echo: every "|  n>" line,
+ * and the block from the "INPUT FILE" header to "****END OF INPUT****".
+ * Inside the block only echoed lines, blanks, '=' rules and the NAME line
+ * are skipped; any other line ends the block early, sets echo_unclosed
+ * and is returned, so a block without its end marker cannot hide the
+ * rest of the output. echo_seen counts the skipped lines.
  */
 typedef struct OutputLines {
   const char *at;
   int in_input;
-  int echo_starts;
+  int echo_unclosed;
+  unsigned long echo_seen;
 } OutputLines;
 
 static int next_output_line(OutputLines *it, const char **line_out,
@@ -381,20 +410,32 @@ static int next_output_line(OutputLines *it, const char **line_out,
     if (it->in_input) {
       if (line_has(line, end, "****end of input****")) {
         it->in_input = 0;
+        ++it->echo_seen;
+        continue;
       }
-      continue;
+      if (is_echo_line(line, end) || is_echo_frame_line(line, end)) {
+        ++it->echo_seen;
+        continue;
+      }
+      it->in_input = 0;
+      it->echo_unclosed = 1;
     }
     if (line_is(line, end, "input file")) {
       it->in_input = 1;
-      ++it->echo_starts;
+      ++it->echo_seen;
       continue;
     }
     if (is_echo_line(line, end)) {
+      ++it->echo_seen;
       continue;
     }
     *line_out = line;
     *end_out = end;
     return 1;
+  }
+  if (it->in_input) {
+    it->in_input = 0;
+    it->echo_unclosed = 1;
   }
   return 0;
 }
@@ -436,10 +477,10 @@ int orcac_scf_not_converged(const char *text) {
  */
 static int is_termination_banner(const char *line, const char *end) {
   static const char kBanner[] = "ORCA TERMINATED NORMALLY";
-  while (line < end && (isspace((unsigned char)*line) || *line == '*')) {
+  while (line < end && (is_blank(*line) || *line == '*')) {
     ++line;
   }
-  while (end > line && (isspace((unsigned char)end[-1]) || end[-1] == '*')) {
+  while (end > line && (is_blank(end[-1]) || end[-1] == '*')) {
     --end;
   }
   return (size_t)(end - line) == sizeof(kBanner) - 1u &&
@@ -447,15 +488,18 @@ static int is_termination_banner(const char *line, const char *end) {
 }
 
 /*
- * The banner counts only as a line of its own outside the input echo,
- * and only after the last echo block has ended, so neither the echoed
- * deck nor anything printed before the echo can supply it.
+ * The banner counts only as a line of its own, read by the same loop as
+ * the SCF scan so the echoed deck is skipped, with no echo after it and
+ * no echo block left without its end marker. Neither the echoed deck,
+ * nor text before the echo, nor a line that cut an echo block short can
+ * supply it.
  */
 int orcac_terminated_normally(const char *text) {
   OutputLines it;
   const char *line;
   const char *end;
-  int found_after = -1;
+  int found = 0;
+  unsigned long found_at = 0;
   if (text == NULL) {
     return 0;
   }
@@ -463,8 +507,9 @@ int orcac_terminated_normally(const char *text) {
   it.at = text;
   while (next_output_line(&it, &line, &end)) {
     if (is_termination_banner(line, end)) {
-      found_after = it.echo_starts;
+      found = 1;
+      found_at = it.echo_seen;
     }
   }
-  return !it.in_input && found_after >= 0 && found_after == it.echo_starts;
+  return found && !it.echo_unclosed && found_at == it.echo_seen;
 }

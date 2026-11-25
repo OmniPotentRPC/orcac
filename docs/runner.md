@@ -100,7 +100,10 @@ an unconverged SCF (`ORCAC_E_NOT_CONVERGED`), or writes an `.engrad` file
 that does not parse or does not match the input atoms. The SCF check runs
 before the exit status. It skips ORCA's echo of the input, from the
 `INPUT FILE` header to `****END OF INPUT****` and every `|  n>` line, so
-a comment in the deck cannot fail a converged run. Outside the echo, a
+a comment in the deck cannot fail a converged run. Inside that block
+only echoed lines, blank lines, `=` rules and the `NAME =` line are
+skipped; any other line ends the block, so a missing end marker cannot
+hide the rest of the output. Outside the echo, a
 line counts when it holds, in any case, one of these banners:
 
 - `SCF NOT CONVERGED AFTER`
@@ -115,9 +118,12 @@ optimisation's message does not. Case folding is ASCII only.
 
 A run that exits 0 must also print `****ORCA TERMINATED NORMALLY****`
 (any number of asterisks, including none) as a line of its own, outside
-the input echo and after the last echo block has ended. The banner in a
-deck comment, on an echoed line, inside a longer line, or before the
-echo does not count.
+the input echo, read by the same line loop as the SCF check, with no
+echoed line after it and no echo block cut short. The banner in a deck
+comment (including one in `OrcaCConfig.blocks`), on an echoed line,
+inside a longer line, or before the echo does not count, on the exit-0
+path or when the exit status was lost to another waiter. Blanks are
+ASCII only.
 
 The `.engrad` parser reads, in order, the atom count, the energy in Eh,
 3N gradient components in Eh/bohr, and the atomic numbers with Bohr

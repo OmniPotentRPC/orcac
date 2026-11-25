@@ -121,9 +121,25 @@ static void test_scf_banner(const char *root) {
         "region phrases outside the SCF block flagged");
   CHECK(!orcac_scf_not_converged("|  7> SCF NOT CONVERGED AFTER 3\n"),
         "echo line outside an echo block flagged");
-  CHECK(!orcac_scf_not_converged(
+  CHECK(orcac_scf_not_converged(
             "    INPUT FILE\n| 1> x\nSCF DID NOT CONVERGE\n"),
-        "text inside an unterminated echo block flagged");
+        "banner after an echo block without its end marker missed");
+  CHECK(orcac_scf_not_converged(
+            "=======\n    INPUT FILE\n=======\nNAME = orcac.inp\n"
+            "|  1> ! HF\n\n--------------\nSCF ITERATIONS\n--------------\n"
+            "  0  -75.40\n  Warning: SCF not yet converged\n"),
+        "SCF block after an unterminated echo block skipped");
+  CHECK(!orcac_scf_not_converged(
+            "    INPUT FILE\n=======\nNAME = orcac.inp\n"
+            "|  1> # SCF DID NOT CONVERGE\n\n"
+            "|  2> # not yet converged\n"),
+        "echoed lines of an unterminated echo block flagged");
+  CHECK(!orcac_scf_not_converged(
+            "    INPUT FILE\n|  1> x\n|  2> ****END OF INPUT****\n"
+            "SCF ITERATIONS\n  converged\n"
+            "    INPUT FILE\n|  1> # SCF DID NOT CONVERGE\n"
+            "|  2> ****END OF INPUT****\n"),
+        "second echo block flagged");
   CHECK(!orcac_scf_not_converged("The optimization has not converged yet\n"),
         "geometry message not flagged");
   CHECK(!orcac_scf_not_converged("SCF iterations\nnot converged elsewhere\n"),
@@ -191,6 +207,18 @@ static void test_termination_banner(const char *root) {
             "ORCA TERMINATED NORMALLY\n"
             "|  2>        ****END OF INPUT****\n"),
         "unprefixed banner inside the echo block counted");
+  CHECK(!orcac_terminated_normally(
+            "    INPUT FILE\n|  1> x\n|  2> ****END OF INPUT****\n"
+            "ORCA TERMINATED NORMALLY\n|  3> # stray echo\n"),
+        "banner followed by an echoed line counted");
+  CHECK(orcac_terminated_normally(
+            "=====\n    INPUT FILE\n=====\nNAME = orcac.inp\n|  1> x\n\n"
+            "|  2> ****END OF INPUT****\n=====\n"
+            "\t****ORCA TERMINATED NORMALLY****\r\n"),
+        "banner after a framed echo block missed");
+  CHECK(!orcac_terminated_normally("\xa0ORCA TERMINATED NORMALLY\n") &&
+            !orcac_terminated_normally("ORCA TERMINATED NORMALLY\xa0\n"),
+        "non-ASCII byte taken as a blank around the banner");
   CHECK(!orcac_terminated_normally("ORCA TERMINATED\n") &&
             !orcac_terminated_normally("") && !orcac_terminated_normally(NULL),
         "partial or empty text counted");
