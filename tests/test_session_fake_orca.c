@@ -26,7 +26,7 @@ static const char *k_knobs[] = {
     "ORCAC_FAKE_MOREAD_FAIL", "ORCAC_FAKE_FAIL",
     "ORCAC_FAKE_NO_ENGRAD", "ORCAC_FAKE_BAD_ENGRAD",
     "ORCAC_FAKE_SLEEP",     "ORCAC_FAKE_PIDFILE",
-    "ORCAC_FAKE_STDOUT",
+    "ORCAC_FAKE_STDOUT",    "ORCAC_FAKE_ECHO_INPUT",
 };
 
 static void clear_knobs(void) {
@@ -252,6 +252,29 @@ static void test_failures(void) {
   orcac_session_destroy(s);
 }
 
+/* ORCA copies the input into its output, so a verbatim keywords block whose
+ * comment names an SCF failure must not fail a converged run. */
+static void test_echoed_comment(void) {
+  clear_knobs();
+  struct ORCAParams p = hf();
+  p.keywords = test_text("%scf\n  # retry by hand if SCF NOT CONVERGED\n"
+                         "  MaxIter 200\nend");
+  OrcaCSession *s = make_session(p);
+  CHECK(s != NULL);
+  if (!s)
+    return;
+  setenv("ORCAC_FAKE_ECHO_INPUT", "1", 1);
+  double g[9];
+  OrcaCResult r = orcac_session_energy_gradient(s, 3, k_water, k_water_z, g);
+  CHECK(r.ok == 1);
+  CHECK(log_count("# retry by hand if SCF NOT CONVERGED") == 1);
+
+  /* A banner after the echo still fails the step. */
+  setenv("ORCAC_FAKE_SCF_FAIL_EXIT0", "1", 1);
+  expect_failure(s, "ORCA SCF did not converge (exit status 0)");
+  orcac_session_destroy(s);
+}
+
 static void test_timeout(void) {
   clear_knobs();
   struct ORCAParams p = hf();
@@ -438,6 +461,7 @@ int main(int argc, char **argv) {
   test_restart_false();
   test_moread_failure_retries();
   test_failures();
+  test_echoed_comment();
   test_timeout();
   test_executable_resolution();
   test_keep_files_and_params();

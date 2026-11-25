@@ -24,7 +24,7 @@ parameter messages, units, executable lookup and `ORCAC_LIBRARY` /
 | input | `! <method> <basis> <keywords> EnGrad`, then `! MORead` and `%moinp` when orbitals are reused, `%pal nprocs` when `nprocs` > 1, `%maxcore`, a verbatim block when `keywords` starts with `!` or `%` or spans lines, and `* xyz charge multiplicity` in Angstrom |
 | run | `orca orcac.inp` in a private `mkdtemp` directory, stdout and stderr to files, stdin from `/dev/null`, a new process group |
 | timeout | `timeoutS` (default 3600 s, 0 waits without a limit): SIGTERM to the group, SIGKILL two seconds later if anything is left, then reaped |
-| failure | non-zero exit, a signal, an unconverged SCF (detected in the output even at exit 0), a missing or malformed `.engrad`, or atomic numbers that differ from the input; the message carries the tails of stderr and of the output |
+| failure | non-zero exit, a signal, an unconverged SCF (detected in the output even at exit 0, outside ORCA's echo of the input), a missing or malformed `.engrad`, or atomic numbers that differ from the input; the message carries the tails of stderr and of the output |
 | orbitals | after a success the `.gbw` is kept and the next step with the same atoms reads it (`restart`, default on); a failed `MORead` step is retried once from ORCA's own guess |
 | numbers | written and read in the C locale whatever `LC_NUMERIC` the host set; each coordinate is the shortest text that reads back as the same double, so ORCA sees exactly the geometry it was given |
 

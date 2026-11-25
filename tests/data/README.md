@@ -13,6 +13,7 @@ the only test that runs ORCA, and it skips when no ORCA is found.
 | `h2_handwritten.engrad` | Hand-written two-atom `.engrad` with a comment preamble, from the earlier rgpot ORCA provider's tests. |
 | `normal_termination.out` | Hand-written excerpt in the shape of an ORCA output that ends normally. Not a recorded run. |
 | `scf_not_converged.out` | Hand-written excerpt in the shape of an ORCA output whose SCF did not converge. Not a recorded run. |
+| `scf_echo_comment.out` | Hand-written excerpt of a converged run whose echoed input carries a comment with SCF failure wordings, framed the way ORCA echoes its input. Not a recorded run. |
 | `golden/*.inp` | Expected ORCA input decks, written independently of the C renderer (Python string formatting) so the two implementations check each other. |
 | `fake_orca.sh` | A shell stand-in for the `orca` executable. It records the input it receives, copies an `.engrad` fixture into place and writes a dummy `.gbw`; environment variables make it fail in the ways the tests need (see the header of the script). |
 

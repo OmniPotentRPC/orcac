@@ -549,6 +549,51 @@ static int contains(const char *text, size_t length, const char *needle) {
   return 0;
 }
 
+static int is_blank(char c) {
+  return c == ' ' || c == '\t' || c == '\r' || c == '\v' || c == '\f';
+}
+
+/* [b, e) is word with only blanks around it. */
+static int line_is(const char *b, const char *e, const char *word) {
+  while (b < e && is_blank(*b))
+    ++b;
+  while (e > b && is_blank(e[-1]))
+    --e;
+  return (size_t)(e - b) == strlen(word) && memcmp(b, word, (size_t)(e - b)) == 0;
+}
+
+/* ORCA echoes each input line as "|  12> text". */
+static int is_echo_line(const char *b, const char *e) {
+  while (b < e && *b == ' ')
+    ++b;
+  if (b == e || *b != '|')
+    return 0;
+  ++b;
+  while (b < e && *b == ' ')
+    ++b;
+  if (b == e || *b < '0' || *b > '9')
+    return 0;
+  while (b < e && *b >= '0' && *b <= '9')
+    ++b;
+  return b < e && *b == '>';
+}
+
+/* A line of the echo block that is not an echoed input line: blank, a rule
+ * of '=', or "NAME = file". */
+static int is_echo_frame_line(const char *b, const char *e) {
+  while (b < e && is_blank(*b))
+    ++b;
+  if (b == e)
+    return 1;
+  if (*b == '=') {
+    while (b < e && (*b == '=' || is_blank(*b)))
+      ++b;
+    return b == e;
+  }
+  return (size_t)(e - b) >= 4 && memcmp(b, "NAME", 4) == 0 &&
+         memchr(b + 4, '=', (size_t)(e - b - 4)) != NULL;
+}
+
 int orcac_scf_failed(const char *text, size_t length) {
   /* Wordings ORCA prints when the SCF stops unconverged, and the
    * error-termination line that follows them. */
@@ -560,8 +605,37 @@ int orcac_scf_failed(const char *text, size_t length) {
   };
   if (!text)
     return 0;
-  for (size_t i = 0; i < sizeof(markers) / sizeof(markers[0]); ++i)
-    if (contains(text, length, markers[i]))
-      return 1;
+  /* ORCA copies the input into its output between "INPUT FILE" and
+   * "****END OF INPUT****", so a comment in a verbatim keywords block must
+   * not read as a banner. Any other line ends the block early, so a block
+   * without its end marker cannot hide the rest of the output. */
+  int in_input = 0;
+  const char *p = text;
+  const char *end = text + length;
+  while (p < end) {
+    const char *eol = memchr(p, '\n', (size_t)(end - p));
+    if (!eol)
+      eol = end;
+    const char *b = p, *e = eol;
+    p = eol < end ? eol + 1 : end;
+    if (in_input) {
+      if (contains(b, (size_t)(e - b), "****END OF INPUT****")) {
+        in_input = 0;
+        continue;
+      }
+      if (is_echo_line(b, e) || is_echo_frame_line(b, e))
+        continue;
+      in_input = 0;
+    }
+    if (line_is(b, e, "INPUT FILE")) {
+      in_input = 1;
+      continue;
+    }
+    if (is_echo_line(b, e))
+      continue;
+    for (size_t i = 0; i < sizeof(markers) / sizeof(markers[0]); ++i)
+      if (contains(b, (size_t)(e - b), markers[i]))
+        return 1;
+  }
   return 0;
 }
